@@ -1,6 +1,6 @@
 # eval
 
-> Execute one Python, JavaScript, Ruby, or Julia cell in a persistent language runtime. One tool call is one cell; state survives later calls.
+> Execute one Python, JavaScript, Ruby, Julia, or Go/Yaegi cell in a persistent language runtime. One tool call is one cell; state survives later calls.
 
 > **Notice:** Do not shell out to `python -c`, `ruby -e`, `julia -e`, `bun -e`, or `node -e` through `bash` for ad-hoc code. `eval` provides retained state, structured `display()` capture, tool/subagent bridges, streaming, cancellation, and artifact-backed truncation.
 
@@ -14,6 +14,7 @@
 - Python: `packages/coding-agent/src/eval/py/`
 - Ruby: `packages/coding-agent/src/eval/rb/`
 - Julia: `packages/coding-agent/src/eval/jl/`
+- Go/Yaegi: `packages/coding-agent/src/eval/go/`
 - Output/truncation: `packages/coding-agent/src/session/streaming-output.ts`
 - Python internals: `docs/python-repl.md`
 
@@ -23,7 +24,7 @@ The params object is one cell. There is no `cells` array, header parser, languag
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `language` | `"py" \| "js" \| "rb" \| "jl"` | Yes | Explicit backend token. Normally the live schema includes only enabled runtimes; see the all-disabled edge case below. |
+| `language` | `"py" \| "js" \| "rb" \| "jl" \| "go"` | Yes | Explicit backend token. Normally the live schema includes only enabled runtimes; see the all-disabled edge case below. |
 | `code` | `string` | Yes | Cell body, verbatim. |
 | `title` | `string` | No | Short transcript label. |
 | `timeout` | `number` | No | Runtime-work timeout in seconds. Default 30; `0` disables the cell timeout. Nonzero values are clamped by the tool timeout policy and `tools.maxTimeout`. |
@@ -53,8 +54,9 @@ Example across three calls:
 | `js` | retained Bun worker VM | `eval.js=true` | `PI_JS` | bundled JS runtime |
 | `rb` | retained Ruby kernel | `eval.rb=false` | `PI_RB` | usable `ruby.interpreter` or discovered Ruby |
 | `jl` | retained Julia kernel | `eval.jl=false` | `PI_JL` | usable `julia.interpreter` or discovered Julia |
+| `go` | retained Go/Yaegi helper | `eval.go=false` | `PI_GO` | usable `go.interpreter` or `omp-eval-go-runner` on PATH |
 
-Ruby and Julia are opt-in. When at least one runtime is enabled, disabled runtimes are removed from the session-scoped wire schema and model prompt. If **all four** are disabled, the current `parameters` fallback returns the full static union even though every execution is rejected by `resolveBackend(...)`; this contradicts the nearby source comment that disabled backends never reach the model. A requested unavailable runtime raises `ToolError`; the tool never substitutes another language.
+Ruby and Julia are opt-in. When at least one runtime is enabled, disabled runtimes are removed from the session-scoped wire schema and model prompt. If all five are disabled, the wire schema advertises no valid language values and every execution is rejected by `resolveBackend(...)`. A requested unavailable runtime raises `ToolError`; the tool never substitutes another language.
 
 ## Outputs
 
@@ -81,7 +83,7 @@ The renderer merges call and result inline, syntax-highlights from the declared 
 ## Execution flow
 
 1. `EvalTool` builds a session-specific schema from enabled languages. It is essential, strict, `approval="exec"`, and `concurrency="exclusive"` within one agent session.
-2. `execute()` maps `py/js/rb/jl` to `python/js/ruby/julia`, resolves availability, and wraps the single input in the renderer-compatible internal cell list.
+2. `execute()` maps `py/js/rb/jl/go` to `python/js/ruby/julia/go`, resolves availability, and wraps the single input in the renderer-compatible internal cell list.
 3. It obtains the retained executor id from `session.getEvalSessionId?.()` or `defaultEvalSessionId(session)`, allocates the output sink/artifact, and registers the run through `trackEvalExecution?.(...)`.
 4. The timeout defaults to 30 seconds. `0` creates no watchdog. Otherwise `IdleTimeout` is combined with tool and session abort signals.
 5. `agent()`, `parallel()`, and `completion()` emit pause/resume status operations: time spent in those host bridges does not consume the cell's runtime-work budget. Compute, output, status helpers, and ordinary `tool.*` calls do consume it.
@@ -114,6 +116,16 @@ The renderer merges call and result inline, syntax-highlights from the declared 
 - Rich display supports the OMP MIME convention and IRuby-compatible MIME hooks, using the shared kernel display pipeline.
 - `reset` replaces the retained Ruby kernel.
 
+### Go/Yaegi (`go`)
+
+- Retained external helper keyed by `go:${sessionId}`, normalized cwd, and helper path.
+- The helper embeds Yaegi and exposes only the narrow `omp` facade; it never receives Bun objects, `AgentRegistry`, or `IrcBus`.
+- `omp.Tool(name, args)`, `omp.Agent(prompt)`, `omp.AgentWith(prompt, options)`, and `omp.Hub(op, args)` call the host-side capability broker. Retained external runners receive a loopback, session/run-scoped endpoint and never receive the authenticated bearer token.
+- Go is currently an **external-helper capability**: npm and release assets do not contain a prebuilt helper binary. Build it from a checkout (after `bun install`) with `GO_TARGET=linux-x64 GO_OUTPUT_DIR="$HOME/.local/lib/omp" bun --cwd=packages/coding-agent run build:go-runner`, or from an installed source package with `bun --cwd="$PKG" run build:go-runner`; standalone compiled OMP binaries do not contain the Go source/builder, so obtain the helper from a matching checkout/package. Use the resulting absolute path in `go.interpreter` (relative paths are resolved against the session cwd), or symlink the helper as `omp-eval-go-runner` on PATH. Supported targets are `darwin-arm64`, `darwin-amd64`, `linux-arm64`, `linux-amd64`, and `windows-amd64` (aliases such as `x64` are accepted); `linux-amd64`/`linux-arm64` are static and can serve musl, while `linux-musl-x64` is not a valid `GO_TARGET`. No system Go compiler is needed after the helper is built.
+  The source package includes the runner source and build scripts for this opt-in development capability, but packaging never builds or includes a helper executable; standalone release binaries likewise have no Go sidecar.
+- From this checkout, `bun run go-eval -- --help` is the one-command development launcher: it builds/caches the host-target helper, enables `eval.go` through a temporary environment config overlay, and forwards all CLI arguments unchanged. The first `--` is Bun's script-argument separator; it requires Bun and a system Go compiler on first run. The helper is cached under `$OMP_GO_CACHE_DIR` when set, otherwise `$XDG_CACHE_HOME/omp/eval-runners` or `~/.cache/omp/eval-runners`. The package-local equivalent is `bun run --cwd=packages/coding-agent go-eval -- --help`; an existing helper on `PATH` needs only `PI_GO=1 omp`.
+- Cancellation interrupts the Yaegi context and escalates to terminating the helper when it ignores cancellation.
+
 ### Julia (`jl`)
 
 - Retained kernels are keyed by `julia:${sessionId}`, normalized cwd, and interpreter.
@@ -130,6 +142,8 @@ All enabled runtimes expose equivalent helpers where the language permits:
 - `tool.<name>(args)` for a normal session tool call
 - `completion(...)`, `agent(...)`, `parallel(...)`, `pipeline(...)`
 - `log(message)`, `phase(title)`, `budget`
+
+The bridge bearer is kept in the OMP host and is not placed in retained external-runner environments or IPC traces. Eval code still runs inside its interpreter process: treat eval as trusted code and do not use language-level introspection as a security boundary. JS runs in its isolated worker; Go additionally exposes only its allowlisted Yaegi facade.
 
 JS filesystem/bridge helpers are asynchronous; Python, Ruby, and Julia helpers are synchronous. `read()` delegates non-`local://` schemes to the registered read tool, resolves `local://` through injected roots, and reads regular paths relative to cwd. `write()` accepts regular and `local://` paths but rejects other protocol URLs.
 
@@ -182,6 +196,6 @@ Runs one subagent through `runStructuredSubagent(...)`:
 
 - One call is one cell. Use separate calls to exploit persistence and rerun only the failed step.
 - State is isolated by language; resetting Python does not reset JS, Ruby, or Julia.
-- Current schema tokens are only `py`, `js`, `rb`, and `jl`; long language names are renderer/approval formatting aliases, not wire values.
+- Current schema tokens are `py`, `js`, `rb`, `jl`, and `go`; long language names are renderer/approval formatting aliases, not wire values.
 - The former multi-cell `cells` payload, `*** Cell` parser, sniffing fallback, and constrained `eval.lark` grammar are removed.
 - Parent and ordinary task subagents may share an inherited eval executor id; children created by eval's own `agent()` explicitly do not.

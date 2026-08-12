@@ -32,6 +32,8 @@ export interface KernelExecutorBaseOptions {
 	onStatus?: (event: JsStatusEvent) => void;
 	emitStatus?: (event: JsStatusEvent) => void;
 	toolSession?: ToolSession;
+	/** Logical owner used to scope bridge registrations and retained kernels. */
+	kernelOwnerId?: string;
 	bridgeSessionId?: string;
 	artifactId?: string;
 	artifactPath?: string;
@@ -278,7 +280,7 @@ interface ManagedKernelEnvOptions {
 	sessionFile?: string;
 	artifactsDir?: string;
 	bridgeSessionId?: string;
-	bridge?: { url: string; token: string };
+	bridge?: { url: string; token: string; evalUrl?: string };
 	localRoots?: Record<string, string>;
 }
 interface ManagedKernelEnvPolicy {
@@ -300,8 +302,11 @@ export function buildManagedKernelEnvPatch(
 		if (options.sessionFile) patch.PI_SESSION_FILE = options.sessionFile;
 		if (options.artifactsDir) patch.PI_ARTIFACTS_DIR = options.artifactsDir;
 		if (options.bridge) {
-			patch.PI_TOOL_BRIDGE_URL = options.bridge.url;
-			patch.PI_TOOL_BRIDGE_TOKEN = options.bridge.token;
+			// Retained external interpreters execute arbitrary user code in their
+			// own process. Give them only the host-side capability-broker route;
+			// never put the authenticated bridge bearer into their request env.
+			patch.PI_TOOL_BRIDGE_URL = options.bridge.evalUrl ?? options.bridge.url;
+			patch.PI_TOOL_BRIDGE_TOKEN = undefined;
 			patch.PI_TOOL_BRIDGE_SESSION = options.bridgeSessionId ?? "";
 		}
 		if (localRoots) patch.PI_EVAL_LOCAL_ROOTS = JSON.stringify(localRoots);
@@ -310,8 +315,10 @@ export function buildManagedKernelEnvPatch(
 	return {
 		PI_SESSION_FILE: options.sessionFile ?? null,
 		PI_ARTIFACTS_DIR: options.artifactsDir ?? null,
-		PI_TOOL_BRIDGE_URL: options.bridge?.url ?? null,
-		PI_TOOL_BRIDGE_TOKEN: options.bridge?.token ?? null,
+		// See the sparse branch above: external runners receive only the
+		// tokenless host-side capability broker endpoint.
+		PI_TOOL_BRIDGE_URL: options.bridge ? (options.bridge.evalUrl ?? options.bridge.url) : null,
+		PI_TOOL_BRIDGE_TOKEN: null,
 		PI_TOOL_BRIDGE_SESSION: options.bridge && options.bridgeSessionId ? options.bridgeSessionId : null,
 		PI_EVAL_LOCAL_ROOTS: localRoots && Object.keys(localRoots).length > 0 ? JSON.stringify(localRoots) : null,
 	};
@@ -336,21 +343,24 @@ export function buildManagedKernelEnv(
 	return hasKeys ? env : undefined;
 }
 
+function fallbackOwnerKey(sessionId: string): string {
+	return `fallback:${sessionId}`;
+}
+
 export function attachSessionOwner(
 	session: { ownerIds: Set<string>; hasFallbackOwner: boolean },
 	sessionId: string,
 	ownerId: string | undefined,
 ): void {
 	if (ownerId !== undefined) {
-		if (session.hasFallbackOwner) {
-			session.ownerIds.delete(sessionId);
-			session.hasFallbackOwner = false;
-		}
+		// An unscoped caller is an independent fallback owner. Keep it while an
+		// explicit owner attaches; namespacing prevents an owner id equal to the
+		// session id from collapsing the two logical owners into one Set entry.
 		session.ownerIds.add(ownerId);
 		return;
 	}
-	if (session.hasFallbackOwner || session.ownerIds.size === 0) {
-		session.ownerIds.add(sessionId);
+	if (!session.hasFallbackOwner) {
+		session.ownerIds.add(fallbackOwnerKey(sessionId));
 		session.hasFallbackOwner = true;
 	}
 }
@@ -483,6 +493,7 @@ export async function executeWithKernelBase<
 		options?.toolSession && options?.bridgeSessionId
 			? registerPyToolBridge(options.bridgeSessionId, runId, {
 					toolSession: options.toolSession,
+					ownerId: options.kernelOwnerId,
 					signal: options.signal,
 					shieldedSignal: abortShield.signal,
 					emitStatus,

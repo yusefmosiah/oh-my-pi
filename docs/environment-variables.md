@@ -373,9 +373,12 @@ Use `ANTHROPIC_SEARCH_BASE_URL` (optionally with `ANTHROPIC_SEARCH_API_KEY`) to 
 | `PI_JS`                | Boolean-like override for JavaScript; unset defers to `eval.js` (default enabled)                   |
 | `PI_RB`                | Boolean-like override for Ruby; unset defers to `eval.rb` (default disabled)                        |
 | `PI_JL`                | Boolean-like override for Julia; unset defers to `eval.jl` (default disabled)                       |
+| `PI_GO`               | Boolean-like override for Go/Yaegi; unset defers to `eval.go` (default disabled)                  |
 | `PI_PYTHON_SKIP_CHECK` | Truthy flag skips Python interpreter availability checks (subprocess runner still starts on demand) |
+| `PI_GO_SKIP_CHECK`     | Truthy flag skips Yaegi helper availability checks                                                |
 | `PI_RUBY_SKIP_CHECK`   | Truthy flag skips Ruby interpreter availability checks                                              |
 | `PI_PYTHON_IPC_TRACE`  | Truthy flag logs NDJSON frames exchanged with the Python runner subprocess                          |
+| `PI_GO_IPC_TRACE`      | Truthy flag logs NDJSON frames exchanged with the Go/Yaegi helper subprocess                    |
 | `PI_RUBY_IPC_TRACE`    | Truthy flag logs Ruby runner IPC frames                                                             |
 | `PI_JULIA_IPC_TRACE`   | Truthy flag logs Julia runner IPC frames                                                            |
 | `VIRTUAL_ENV`          | Highest-priority venv path for Python runtime resolution                                            |

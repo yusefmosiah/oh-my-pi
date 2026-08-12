@@ -27,6 +27,8 @@ export type WorkerInbound =
 	| { type: "init"; snapshot: SessionSnapshot }
 	| { type: "run"; runId: string; code: string; filename: string; snapshot: SessionSnapshot }
 	| { type: "tool-reply"; id: string; reply: ToolReply }
+	/** Cooperatively cancel one run without tearing down a worker shared by other owners. */
+	| { type: "cancel-run"; runId: string; error?: RunErrorPayload }
 	| { type: "close" };
 
 export type WorkerOutbound =

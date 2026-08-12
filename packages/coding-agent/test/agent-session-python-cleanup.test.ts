@@ -5,6 +5,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as pythonExecutor from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import type { PythonKernel as PythonKernelInstance } from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
 import * as pythonKernel from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
+import * as toolBridge from "@oh-my-pi/pi-coding-agent/eval/tool-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession, type ExtensionFactory, type WorkspaceTree } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -187,6 +188,7 @@ describe("AgentSession python cleanup", () => {
 		const throwingExtension: ExtensionFactory = () => {
 			throw new Error("Extension init failed");
 		};
+		const disposeToolBridgeByOwnerSpy = vi.spyOn(toolBridge, "disposeToolBridgeByOwner").mockResolvedValue(undefined);
 		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		const startSpy = vi
 			.spyOn(pythonKernel.PythonKernel, "start")
@@ -220,6 +222,8 @@ describe("AgentSession python cleanup", () => {
 			}),
 		).rejects.toThrow("Extension init failed");
 
+		expect(disposeToolBridgeByOwnerSpy).toHaveBeenCalledTimes(1);
+		expect(disposeToolBridgeByOwnerSpy.mock.calls[0]?.[0]).toMatch(/^agent-session:/);
 		expect(startSpy).toHaveBeenCalledTimes(1);
 		expect(unrelatedKernel.shutdown).not.toHaveBeenCalled();
 

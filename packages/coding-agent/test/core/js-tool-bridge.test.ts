@@ -143,6 +143,6 @@ describe("callSessionTool", () => {
 	it("throws when the requested tool is not available in the session registry", async () => {
 		const session = createSession([]);
 
-		await expect(callSessionTool("missing", {}, { session })).rejects.toThrow("Unknown tool from js runtime");
+		await expect(callSessionTool("missing", {}, { session })).rejects.toThrow("Unknown tool from eval runtime");
 	});
 });

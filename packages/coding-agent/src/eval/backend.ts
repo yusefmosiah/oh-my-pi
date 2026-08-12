@@ -51,7 +51,7 @@ export interface ExecutorBackend {
 	/** Source language identifier passed to the syntax highlighter (e.g. "python", "javascript"). */
 	readonly highlightLang: string;
 	/** Cheap availability check. Used by fallback resolution. */
-	isAvailable(session: ToolSession): Promise<boolean>;
+	isAvailable(session: ToolSession, signal?: AbortSignal): Promise<boolean>;
 	/** Execute one cell. Caller invokes once per cell and aggregates results. */
 	execute(code: string, opts: ExecutorBackendExecOptions): Promise<ExecutorBackendResult>;
 }

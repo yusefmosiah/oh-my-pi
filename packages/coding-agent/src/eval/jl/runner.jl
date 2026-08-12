@@ -9,6 +9,14 @@ using Base64
 # user-provided value, mirroring the Python runner's MPLBACKEND=Agg default.
 get!(ENV, "GKSwstype", "100")
 
+# Bridge credentials are delivered in each request and held in runner-owned
+# state, not ENV. Scrub inherited values before any user code or child process
+# can observe them.
+const BRIDGE_ENV_KEYS = ("PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_TOKEN", "PI_TOOL_BRIDGE_SESSION")
+for key in BRIDGE_ENV_KEYS
+    delete!(ENV, key)
+end
+
 const ORIGINAL_STDOUT = stdout
 const ORIGINAL_STDERR = stderr
 const ORIGINAL_STDIN = stdin
@@ -18,7 +26,66 @@ out_rd, out_wr = redirect_stdout()
 err_rd, err_wr = redirect_stderr()
 redirect_stdin(devnull)
 
-global current_rid = nothing
+# Keep the active run identity task-local. Julia tasks may outlive a cell; a
+# process-global run id would let a stale task adopt the next owner's identity.
+const OMP_RUN_ID_KEY = :__omp_eval_run_id
+function __omp_current_run_id()
+    value = try
+        Base.task_local_storage(OMP_RUN_ID_KEY)
+    catch
+        nothing
+    end
+    value isa String ? value : nothing
+end
+function __omp_set_run_id(value)
+    Base.task_local_storage(OMP_RUN_ID_KEY, value)
+    nothing
+end
+
+# Keep credential values and bridge transport in lexical runner closures. The
+# value-only hook is nulled after prelude initialization; only the write-only
+# setter remains global.
+const OMP_RUNNER_BRIDGE_TIMEOUT_SECONDS = 5 * 60
+let state = Ref{Any}(nothing)
+    global __omp_bridge_set_credentials = values -> (state[] = values)
+    global __omp_bridge_call = (name::String, args::Dict{String, Any}) -> begin
+        credentials = state[]
+        base_url, _, session = credentials === nothing ? (nothing, nothing, nothing) : credentials
+        if base_url === nothing || session === nothing
+            error("Tool bridge is not available in this cell.")
+        end
+        # Retained runners receive the complete tokenless broker URL. Keep
+        # accepting a root URL for old callers, but never require/emit a bearer.
+        url = base_url
+        if !endswith(url, "/v1/eval-tool") && !endswith(url, "/v1/tool")
+            url = endswith(url, "/") ? (url * "v1/eval-tool") : (url * "/v1/eval-tool")
+        end
+        payload = Main.json_serialize(Dict(
+            "session" => session,
+            "run" => __omp_current_run_id(),
+            "name" => name,
+            "args" => args,
+        ))
+        io_out = IOBuffer()
+        response = Downloads.request(
+            url,
+            method="POST",
+            headers=["Content-Type" => "application/json"],
+            input=IOBuffer(payload),
+            output=io_out,
+            timeout=OMP_RUNNER_BRIDGE_TIMEOUT_SECONDS,
+        )
+        resp_str = String(take!(io_out))
+        if response.status != 200
+            error("Tool bridge call failed with status $(response.status): $resp_str")
+        end
+        parsed = Main.json_parse(resp_str)
+        if !get(parsed, "ok", false)
+            error("Tool bridge error: $(get(parsed, "error", "Unknown error"))")
+        end
+        get(parsed, "value", nothing)
+    end
+end
 const write_lock = ReentrantLock()
 const drain_state_lock = ReentrantLock()
 
@@ -329,7 +396,7 @@ function marker_overlap(haystack::Vector{UInt8}, needle::Vector{UInt8})
 end
 
 function emit_stream_bytes(kind, bytes::Vector{UInt8})
-    rid = current_rid
+    rid = __omp_current_run_id()
     if rid === nothing || isempty(bytes)
         return
     end
@@ -501,7 +568,7 @@ end
 struct OmpDisplay <: AbstractDisplay end
 
 function Base.display(d::OmpDisplay, value)
-    rid = current_rid
+    rid = __omp_current_run_id()
     if rid !== nothing
         bundle = build_mime_bundle(value)
         emit_frame(Dict("type" => "display", "id" => rid, "bundle" => bundle))
@@ -561,6 +628,13 @@ function should_display_result(parsed_expr)
 end
 
 function apply_request_runtime(cwd, env_pairs)
+    # Clear the previous generation first; sparse env patches must not retain a
+    # bearer token after a bridged cell finishes.
+    __omp_bridge_set_credentials((nothing, nothing, nothing))
+    for key in BRIDGE_ENV_KEYS
+        delete!(ENV, key)
+    end
+
     try
         if !isempty(cwd)
             cd(cwd)
@@ -581,6 +655,7 @@ function apply_request_runtime(cwd, env_pairs)
         delete!(ENV, k)
     end
     
+    bridge_values = Union{Nothing, String}[nothing, nothing, nothing]
     if !isempty(env_pairs)
         for pair in split(env_pairs, ' ')
             if !isempty(pair)
@@ -588,7 +663,22 @@ function apply_request_runtime(cwd, env_pairs)
                     k_b64, v_b64 = split(pair, ':', limit=2)
                     k = String(base64decode(string(k_b64)))
                     v = String(base64decode(string(v_b64)))
-                    ENV[k] = v
+                    if k == "PI_TOOL_BRIDGE_URL" || k == "PI_TOOL_BRIDGE_TOKEN" || k == "PI_TOOL_BRIDGE_SESSION"
+                        if k == "PI_TOOL_BRIDGE_URL"
+                            bridge_values[1] = v
+                        elseif k == "PI_TOOL_BRIDGE_TOKEN"
+                            # Bearers remain in the host-side broker. Ignore
+                            # legacy/request-supplied copies in this process.
+                            bridge_values[2] = nothing
+                        else
+                            bridge_values[3] = v
+                        end
+                        if bridge_values[1] !== nothing && bridge_values[3] !== nothing
+                            __omp_bridge_set_credentials((bridge_values[1]::String, nothing, bridge_values[3]::String))
+                        end
+                    else
+                        ENV[k] = v
+                    end
                 catch
                     # ignore
                 end
@@ -619,7 +709,7 @@ function main()
             env_pairs = string(parts[6])
             code = String(base64decode(string(parts[7])))
             
-            global current_rid = rid
+            __omp_set_run_id(rid)
             emit_frame(Dict("type" => "started", "id" => rid))
             
             apply_request_runtime(cwd, env_pairs)
@@ -639,6 +729,15 @@ function main()
                     ))
                 else
                     ans = Core.eval(Main, parsed)
+                    # The prelude has captured the value-only hook in its
+                    # bridge closure. Remove it before user cells run.
+                    if isdefined(Main, :__omp_prelude_loaded)
+                        try
+                            Base.delete_binding!(Main, :__omp_bridge_call)
+                        catch
+                            global __omp_bridge_call = nothing
+                        end
+                    end
                     if ans !== nothing && !silent && should_display_result(parsed)
                         bundle = build_mime_bundle(ans)
                         emit_frame(Dict("type" => "result", "id" => rid, "bundle" => bundle))
@@ -658,7 +757,7 @@ function main()
                 "executionCount" => 1,
                 "cancelled" => false
             ))
-            global current_rid = nothing
+            __omp_set_run_id(nothing)
         end
     end
 end

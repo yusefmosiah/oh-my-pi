@@ -28,8 +28,8 @@ export default {
 	label: "Julia",
 	highlightLang: "julia",
 
-	async isAvailable(session: ToolSession): Promise<boolean> {
-		const availability = await checkJuliaKernelAvailability(session.cwd, readInterpreterSetting(session));
+	async isAvailable(session: ToolSession, signal?: AbortSignal): Promise<boolean> {
+		const availability = await checkJuliaKernelAvailability(session.cwd, readInterpreterSetting(session), { signal });
 		return availability.ok;
 	},
 

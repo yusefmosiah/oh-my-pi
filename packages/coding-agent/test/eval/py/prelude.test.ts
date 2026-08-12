@@ -28,6 +28,33 @@ async function runPrelude(
 }
 
 describe("python prelude", () => {
+	it("does not expose bridge credentials through env()", async () => {
+		const result = await runPrelude(
+			[
+				'print(env("PI_TOOL_BRIDGE_TOKEN"))',
+				'print("PI_TOOL_BRIDGE_TOKEN" in env())',
+				'print("PI_TOOL_BRIDGE_URL" in env())',
+				'print("PI_TOOL_BRIDGE_SESSION" in env())',
+				'print("_omp_bridge_getter" in globals())',
+				'print("_omp_legacy_bridge_config" in globals())',
+				'print("_tool_proxy_from_env" in globals())',
+				'print("_make_bridge_call" in globals())',
+				'print("__omp_bridge_call__" in globals())',
+				"print(_bridge_call.__defaults__)",
+			].join("\n"),
+			{
+				PI_TOOL_BRIDGE_URL: "http://127.0.0.1:1",
+				PI_TOOL_BRIDGE_TOKEN: "must-not-leak",
+				PI_TOOL_BRIDGE_SESSION: "test-session",
+			},
+		);
+		expect(result).toEqual({
+			stdout: "None\nFalse\nFalse\nFalse\nFalse\nFalse\nFalse\nFalse\nFalse\nNone\n",
+			stderr: "",
+			exitCode: 0,
+		});
+	});
+
 	it("exposes read(path, offset?, limit?) with positional optional args", () => {
 		// The eval docs advertise `read(path, offset?=1, limit?=None)`. A
 		// keyword-only signature (`def read(path, *, offset=1, limit=None)`)

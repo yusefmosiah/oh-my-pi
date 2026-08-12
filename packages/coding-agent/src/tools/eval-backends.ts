@@ -6,6 +6,7 @@ export interface EvalBackendsAllowance {
 	js: boolean;
 	ruby: boolean;
 	julia: boolean;
+	go?: boolean;
 }
 
 /** Read per-backend allowance from settings (py/js default on; rb/jl opt-in, default off). */
@@ -15,6 +16,7 @@ export function readEvalBackendsAllowance(session: ToolSession): EvalBackendsAll
 		js: session.settings.get("eval.js") ?? true,
 		ruby: session.settings.get("eval.rb") ?? false,
 		julia: session.settings.get("eval.jl") ?? false,
+		go: session.settings.get("eval.go") ?? false,
 	};
 }
 
@@ -30,5 +32,6 @@ export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance
 		js: $flag("PI_JS", settings.js),
 		ruby: $flag("PI_RB", settings.ruby),
 		julia: $flag("PI_JL", settings.julia),
+		go: $flag("PI_GO", settings.go),
 	};
 }

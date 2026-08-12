@@ -5,8 +5,14 @@
  * (or sandboxes where subprocess spawning is restricted) does not fail.
  */
 import { afterEach, describe, expect, it } from "bun:test";
-import { disposeAllRubyKernelSessions, executeRubyWithKernel } from "@oh-my-pi/pi-coding-agent/eval/rb/executor";
+import { disposePyToolBridge } from "@oh-my-pi/pi-coding-agent/eval/py/tool-bridge";
+import {
+	disposeAllRubyKernelSessions,
+	executeRuby,
+	executeRubyWithKernel,
+} from "@oh-my-pi/pi-coding-agent/eval/rb/executor";
 import { RubyKernel } from "@oh-my-pi/pi-coding-agent/eval/rb/kernel";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const SHOULD_RUN = Bun.env.PI_RUBY_INTEGRATION === "1";
@@ -14,6 +20,59 @@ const SHOULD_RUN = Bun.env.PI_RUBY_INTEGRATION === "1";
 describe.skipIf(!SHOULD_RUN)("ruby runner subprocess", () => {
 	afterEach(async () => {
 		await disposeAllRubyKernelSessions();
+		await disposePyToolBridge();
+	});
+
+	it("keeps main-thread bridge calls scoped when a prior cell leaves a Thread behind", async () => {
+		using tempDir = TempDir.createSync("@ruby-runner-thread-bridge-");
+		const calls: unknown[] = [];
+		const toolSession = {
+			cwd: tempDir.path(),
+			getToolByName: (name: string) =>
+				name === "echo"
+					? {
+							name,
+							label: name,
+							description: name,
+							parameters: { type: "object" },
+							execute: async (_id: string, args: unknown) => {
+								calls.push(args);
+								return { content: [{ type: "text" as const, text: "echo-ok" }] };
+							},
+						}
+					: undefined,
+		} as unknown as ToolSession;
+		const options = {
+			cwd: tempDir.path(),
+			sessionId: `ruby-thread-bridge-${crypto.randomUUID()}`,
+			toolSession,
+		};
+
+		const first = await executeRuby(
+			[
+				'tool.echo({ "where" => "first" })',
+				"Thread.new do",
+				"sleep 0.4",
+				"begin",
+				'tool.echo({ "where" => "stale" })',
+				'File.write("thread-result", "called")',
+				"rescue Exception => e",
+				'File.write("thread-result", "rejected:" + e.message)',
+				"end",
+				"end",
+				'"spawned"',
+			].join("\n"),
+			options,
+		);
+		expect(first.exitCode).toBe(0);
+
+		const second = await executeRuby(["sleep 0.8", 'tool.echo({ "where" => "second" })'].join("\n"), options);
+		expect(second.exitCode).toBe(0);
+		expect(second.output).toContain("echo-ok");
+		expect(calls.map(args => (args as Record<string, unknown>).where)).toEqual(["first", "second"]);
+		expect(await Bun.file(`${tempDir.path()}/thread-result`).text()).toMatch(
+			/^rejected:tool bridge is unavailable outside the active eval cell/,
+		);
 	});
 
 	it("streams stdout chunks as they are produced", async () => {

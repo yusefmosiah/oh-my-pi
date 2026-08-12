@@ -135,9 +135,13 @@ describe("executePython lifecycle", () => {
 		await executePython("2 + 2", { kernelMode: "session", sessionId: "retry-dead-session", cwd: getProjectDir() });
 
 		expect(startSpy).toHaveBeenCalledTimes(2);
-		expect(kernel.shutdown).toHaveBeenCalledTimes(1);
+		// An unconfirmed shutdown remains retryable; the next lifecycle pass
+		// deliberately retries the old kernel before retaining the replacement.
+		expect(kernel.shutdown).toHaveBeenCalledTimes(2);
 		expect(kernel.execute).toHaveBeenCalledTimes(0);
-		expect(kernelNext.execute).toHaveBeenCalledTimes(2);
+		// The first call cannot replace an unconfirmed dead kernel; the second
+		// lifecycle pass retries shutdown, starts the replacement, and executes once.
+		expect(kernelNext.execute).toHaveBeenCalledTimes(1);
 	});
 
 	it("coalesces concurrent reset requests instead of throwing 'reset already in progress'", async () => {

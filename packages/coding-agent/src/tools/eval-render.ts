@@ -43,10 +43,11 @@ import {
 } from "./render-utils";
 export const EVAL_DEFAULT_PREVIEW_LINES = 10;
 
-function languageForHighlighter(language: EvalLanguage | undefined): "python" | "javascript" | "ruby" | "julia" {
+function languageForHighlighter(language: EvalLanguage | undefined): "python" | "javascript" | "ruby" | "julia" | "go" {
 	if (language === "js") return "javascript";
 	if (language === "ruby") return "ruby";
 	if (language === "julia") return "julia";
+	if (language === "go") return "go";
 	return "python";
 }
 
@@ -81,6 +82,7 @@ function normalizeRenderLanguage(value: string | undefined): EvalLanguage {
 	if (value === "js") return "js";
 	if (value === "rb" || value === "ruby") return "ruby";
 	if (value === "jl" || value === "julia") return "julia";
+	if (value === "go") return "go";
 	return "python";
 }
 

@@ -5,11 +5,12 @@ Parallelize *within* a cell with `parallel(thunks)`, not by batching.
 
 {{#if py}}Top-level `await` works; `asyncio.run(…)` raises error.{{/if}}
 {{#if js}}JS runs under **Bun**: globals (`Bun.file`, `Bun.write`, `Bun.$`, `fetch`, `Buffer`) available; top-level `await`/`return` work.{{/if}}
+{{#if go}}Go runs in a persistent Yaegi helper. Import standard-library packages normally; use `fmt.Println` for output and the injected `omp` package for host calls. The helper is an external capability and must be installed/configured separately; standalone compiled OMP binaries do not bundle it.{{/if}}
 
 On error, fix and re-run only the failing step.
 
 <prelude>
-{{#ifAll py js}}Python: sync, kwargs. JS: async, ONE trailing object literal, never positional.{{else}}{{#if py}}Sync; kwargs.{{/if}}{{#if js}}Async; ONE trailing object literal, never positional.{{/if}}{{/ifAll}}{{#if rb}} Ruby: sync, kwargs.{{/if}}{{#if jl}} Julia: sync, kwargs.{{/if}}
+{{#ifAll py js}}Python: sync, kwargs. JS: async, ONE trailing object literal, never positional.{{else}}{{#if py}}Sync; kwargs.{{/if}}{{#if js}}Async; ONE trailing object literal, never positional.{{/if}}{{/ifAll}}{{#if rb}} Ruby: sync, kwargs.{{/if}}{{#if jl}} Julia: sync, kwargs.{{/if}}{{#if go}} Go/Yaegi cell execution: sync; `omp.Agent` spawns asynchronously, while `omp.Tool` and `omp.Hub` remain synchronous host calls.{{/if}}
 ```
 display(value) → None        print(value, ...) → None
 read(path, offset?=1, limit?=None) → str
@@ -18,6 +19,8 @@ env(key?=None, value?=None) → str | None | dict
 output(*ids, format?="raw", query?=None, offset?=None, limit?=None) → str | dict | list[dict]
 tool.<name>(args) → unknown
     Invoke any session tool; `args` = its parameter object.
+{{#if go}}omp.Tool(name, args) → (any, error)
+    Go/Yaegi host bridge; `args` is `map[string]interface{}`. `omp.Agent(prompt)` starts a background agent and returns job metadata; `omp.AgentWith(prompt, options)` does the same unless `options["async"]` is false. Use `omp.Hub("list", nil)` to discover IDs and `omp.Hub("send", args)` to coordinate.{{/if}}
 completion(prompt, model?="default"|"smol"|"slow", system?=None, schema?=None) → str | dict
     Oneshot, stateless (no history/tools). `model`: "smol" fast | "default" session | "slow" most capable. `schema` (JSON-Schema) → parsed object.
 {{#if spawns}}agent(prompt, agent?="{{spawnDefaultAgent}}", label?=None, schema?=None, schema{{#if js}}Mode{{else}}_mode{{/if}}?="permissive", isolated?=None, apply?=None, merge?=None, handle?=False) → str | dict

@@ -118,11 +118,14 @@ Kernel startup and per-execution environment patching can receive:
 - `PI_SESSION_FILE`
 - `PI_ARTIFACTS_DIR`
 - `PI_TOOL_BRIDGE_URL`
-- `PI_TOOL_BRIDGE_TOKEN`
 - `PI_TOOL_BRIDGE_SESSION`
 - `PI_EVAL_LOCAL_ROOTS`
 
-The runner initializes process state so code executes in the requested cwd, managed env entries are reflected in `os.environ`, and cwd is available on `sys.path`.
+The authenticated `PI_TOOL_BRIDGE_TOKEN` is a legacy direct-prelude setting only;
+managed retained external runners use the host-side tokenless broker and do not
+receive or retain that bearer. The runner initializes process state so code
+executes in the requested cwd, managed env entries are reflected in
+`os.environ`, and cwd is available on `sys.path`.
 
 ## 5) Streaming/chunk and display handling (kernel-backed path)
 

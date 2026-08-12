@@ -1,9 +1,11 @@
 import type { EvalLanguage } from "../../eval/types";
+import { formatGoForDisplay } from "./go";
 import { formatJavaScriptForDisplay } from "./javascript";
 import { formatJuliaForDisplay } from "./julia";
 import { formatPythonForDisplay } from "./python";
 import { formatRubyForDisplay } from "./ruby";
 
+export * from "./go";
 export * from "./javascript";
 export * from "./julia";
 export * from "./python";
@@ -20,5 +22,7 @@ export function formatEvalCodeForDisplay(source: string, language: EvalLanguage)
 			return formatJuliaForDisplay(source);
 		case "python":
 			return formatPythonForDisplay(source);
+		case "go":
+			return formatGoForDisplay(source);
 	}
 }

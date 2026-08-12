@@ -7,6 +7,8 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import {
 	disposeAllVmContexts,
+	disposeVmContextsByOwner,
+	executeInVmContext,
 	setJsEvalWorkerThreadForTests,
 	setWorkerCloseTimeoutMsForTests,
 } from "../../src/eval/js/context-manager";
@@ -18,12 +20,17 @@ const originalWorker = globalThis.Worker;
 interface FakeWorkerStats {
 	closeRequests: number;
 	terminateCalls: number;
+	instances?: number;
+	active?: number;
+	maxActive?: number;
 }
 
 interface FakeWorkerBehavior {
 	exitOnClose: boolean;
 	settleRuns: boolean;
 	errorOnStart?: boolean;
+	readyDelayMs?: number;
+	closeDelayMs?: number;
 	/**
 	 * Reproduces `WorkerCore#runOne` for a floated bridge call: start a tool call
 	 * and report the run finished in the same turn, without awaiting the call.
@@ -111,7 +118,14 @@ function installFakeWorker(stats: FakeWorkerStats, behavior: FakeWorkerBehavior)
 		#closeListeners = new Set<(event: Event) => void>();
 		#errorListeners = new Set<(event: Event) => void>();
 		#readyQueued = false;
+		#readyTimer: ReturnType<typeof setTimeout> | undefined;
 		#exited = false;
+
+		constructor() {
+			stats.instances = (stats.instances ?? 0) + 1;
+			stats.active = (stats.active ?? 0) + 1;
+			stats.maxActive = Math.max(stats.maxActive ?? 0, stats.active);
+		}
 
 		postMessage(message: unknown): void {
 			if (!message || typeof message !== "object") return;
@@ -138,7 +152,9 @@ function installFakeWorker(stats: FakeWorkerStats, behavior: FakeWorkerBehavior)
 				stats.closeRequests++;
 				queueMicrotask(() => {
 					this.#emitMessage({ type: "closed" });
-					if (behavior.exitOnClose) this.#emitClose();
+					if (!behavior.exitOnClose) return;
+					if (behavior.closeDelayMs === undefined) this.#emitClose();
+					else setTimeout(() => this.#emitClose(), behavior.closeDelayMs);
 				});
 			}
 		}
@@ -156,10 +172,17 @@ function installFakeWorker(stats: FakeWorkerStats, behavior: FakeWorkerBehavior)
 			this.#messageListeners.add(listener as (event: MessageEvent) => void);
 			if (!this.#readyQueued) {
 				this.#readyQueued = true;
-				queueMicrotask(() => {
+				const announce = () => {
 					if (behavior.errorOnStart) this.#emitError();
 					else this.#emitMessage({ type: "ready" });
-				});
+				};
+				if (behavior.readyDelayMs === undefined) queueMicrotask(announce);
+				else {
+					this.#readyTimer = setTimeout(() => {
+						this.#readyTimer = undefined;
+						announce();
+					}, behavior.readyDelayMs);
+				}
 			}
 		}
 
@@ -189,6 +212,9 @@ function installFakeWorker(stats: FakeWorkerStats, behavior: FakeWorkerBehavior)
 		#emitClose(): void {
 			if (this.#exited) return;
 			this.#exited = true;
+			if (this.#readyTimer) clearTimeout(this.#readyTimer);
+			this.#readyTimer = undefined;
+			stats.active = Math.max(0, (stats.active ?? 1) - 1);
 			const event = new Event("close");
 			for (const listener of this.#closeListeners) listener(event);
 		}
@@ -279,6 +305,191 @@ describe("JavaScript eval worker lifecycle", () => {
 		});
 		expect(second.exitCode).toBe(0);
 		expect(stats.closeRequests).toBe(1);
+		expect(stats.terminateCalls).toBe(1);
+	});
+
+	it("does not overlap a replacement with global disposal teardown", async () => {
+		using tempDir = TempDir.createSync("@omp-js-dispose-barrier-");
+		const stats: FakeWorkerStats = { closeRequests: 0, terminateCalls: 0 };
+		installFakeWorker(stats, { exitOnClose: true, settleRuns: true, closeDelayMs: 20 });
+		const restore = setWorkerCloseTimeoutMsForTests(100);
+		try {
+			const session = makeSession(tempDir.path());
+			const sessionId = `js-dispose-barrier:${crypto.randomUUID()}`;
+			await executeJs("globalThis.marker = 1;", { cwd: tempDir.path(), sessionId, session });
+
+			const disposing = disposeAllVmContexts();
+			const replacement = executeJs("globalThis.marker = 2;", {
+				cwd: tempDir.path(),
+				sessionId,
+				session,
+			});
+			const [disposed, result] = await Promise.all([disposing, replacement]);
+			void disposed;
+			expect(result.exitCode).toBe(0);
+			expect(stats.instances).toBe(2);
+			expect(stats.maxActive).toBe(1);
+		} finally {
+			setWorkerCloseTimeoutMsForTests(restore);
+		}
+	});
+
+	it("keeps one fallback owner while a different fallback waiter cancels", async () => {
+		using tempDir = TempDir.createSync("@omp-js-fallback-owner-race-");
+		const stats: FakeWorkerStats = { closeRequests: 0, terminateCalls: 0 };
+		installFakeWorker(stats, { exitOnClose: true, settleRuns: true, readyDelayMs: 20 });
+		const session = makeSession(tempDir.path());
+		const controller = new AbortController();
+		const base = {
+			sessionKey: `shared:${crypto.randomUUID()}`,
+			cwd: tempDir.path(),
+			session,
+			code: "return 42;",
+			filename: "fallback-owner-race.js",
+			runState: {},
+		};
+		const first = executeInVmContext({ ...base, sessionId: "fallback-a", runState: { signal: controller.signal } });
+		const second = executeInVmContext({ ...base, sessionId: "fallback-b", runState: {} });
+		await new Promise(resolve => setTimeout(resolve, 0));
+		controller.abort(new DOMException("Execution aborted", "AbortError"));
+		await expect(first).rejects.toThrow();
+		await expect(second).resolves.toEqual({ value: undefined });
+		expect(stats.instances).toBe(1);
+	});
+
+	it("preserves a fallback co-owner during explicit owner disposal", async () => {
+		using tempDir = TempDir.createSync("@omp-js-owner-fallback-preserve-");
+		const stats: FakeWorkerStats = { closeRequests: 0, terminateCalls: 0 };
+		installFakeWorker(stats, { exitOnClose: true, settleRuns: true });
+		const session = makeSession(tempDir.path());
+		const sessionKey = `shared-owner:${crypto.randomUUID()}`;
+		await executeInVmContext({
+			sessionKey,
+			sessionId: "explicit-a",
+			cwd: tempDir.path(),
+			session,
+			code: "return 1;",
+			filename: "owner-fallback-preserve.js",
+			ownerId: "owner-a",
+			runState: {},
+		});
+		await executeInVmContext({
+			sessionKey,
+			sessionId: "fallback-b",
+			cwd: tempDir.path(),
+			session,
+			code: "return 2;",
+			filename: "owner-fallback-preserve.js",
+			runState: {},
+		});
+
+		await disposeVmContextsByOwner("owner-a");
+		await executeInVmContext({
+			sessionKey,
+			sessionId: "fallback-b",
+			cwd: tempDir.path(),
+			session,
+			code: "return 3;",
+			filename: "owner-fallback-preserve.js",
+			runState: {},
+		});
+		expect(stats.instances).toBe(1);
+	});
+
+	it("cancels only the disposed owner's run on a shared worker", async () => {
+		using tempDir = TempDir.createSync("@omp-js-owner-run-dispose-");
+		const session = makeSession(tempDir.path());
+		const sessionKey = `shared-run:${crypto.randomUUID()}`;
+		const base = {
+			sessionKey,
+			cwd: tempDir.path(),
+			session,
+			code: "await new Promise(resolve => setTimeout(resolve, 150)); return 1;",
+			filename: "owner-run-dispose.js",
+			runState: {},
+		};
+		const ownerA = executeInVmContext({ ...base, sessionId: "owner-a-run", ownerId: "owner-a" });
+		const ownerB = executeInVmContext({ ...base, sessionId: "owner-b-run", ownerId: "owner-b" });
+		await new Promise(resolve => setTimeout(resolve, 20));
+		await disposeVmContextsByOwner("owner-a");
+		await expect(ownerA).rejects.toThrow("owner disposed");
+		await expect(ownerB).resolves.toEqual({ value: undefined });
+	});
+
+	it("gates the disposed owner until its worker teardown completes", async () => {
+		using tempDir = TempDir.createSync("@omp-js-owner-dispose-barrier-");
+		const stats: FakeWorkerStats = { closeRequests: 0, terminateCalls: 0 };
+		installFakeWorker(stats, { exitOnClose: true, settleRuns: true, closeDelayMs: 20 });
+		const restore = setWorkerCloseTimeoutMsForTests(100);
+		try {
+			const session = makeSession(tempDir.path());
+			const sessionId = `js-owner-dispose-barrier:${crypto.randomUUID()}`;
+			const ownerId = `owner:${crypto.randomUUID()}`;
+			await executeJs("globalThis.marker = 1;", {
+				cwd: tempDir.path(),
+				sessionId,
+				session,
+				kernelOwnerId: ownerId,
+			});
+
+			const disposing = disposeVmContextsByOwner(ownerId);
+			const replacement = executeJs("globalThis.marker = 2;", {
+				cwd: tempDir.path(),
+				sessionId,
+				session,
+				kernelOwnerId: ownerId,
+			});
+			const [disposed, result] = await Promise.all([disposing, replacement]);
+			void disposed;
+			expect(result.exitCode).toBe(0);
+			expect(stats.instances).toBe(2);
+			expect(stats.maxActive).toBe(1);
+		} finally {
+			setWorkerCloseTimeoutMsForTests(restore);
+		}
+	});
+
+	it("waits for a canceled startup to terminate before retrying the key", async () => {
+		using tempDir = TempDir.createSync("@omp-js-startup-barrier-");
+		const stats: FakeWorkerStats = { closeRequests: 0, terminateCalls: 0 };
+		installFakeWorker(stats, { exitOnClose: true, settleRuns: true, readyDelayMs: 100 });
+		const session = makeSession(tempDir.path());
+		const sessionId = `js-startup-barrier:${crypto.randomUUID()}`;
+		const controller = new AbortController();
+		const first = executeJs("globalThis.marker = 1;", {
+			cwd: tempDir.path(),
+			sessionId,
+			session,
+			signal: controller.signal,
+		});
+		// Let the first caller publish its starting record before canceling it.
+		await new Promise(resolve => setTimeout(resolve, 0));
+		controller.abort(new DOMException("Execution aborted", "AbortError"));
+		const replacement = executeJs("globalThis.marker = 2;", {
+			cwd: tempDir.path(),
+			sessionId,
+			session,
+		});
+		const [firstResult, replacementResult] = await Promise.all([first, replacement]);
+		expect(firstResult.cancelled).toBe(true);
+		expect(replacementResult.exitCode).toBe(0);
+		expect(stats.instances).toBe(2);
+		expect(stats.maxActive).toBe(1);
+	});
+
+	it("aborts never-ready startup without waiting for the init timeout", async () => {
+		using tempDir = TempDir.createSync("@omp-js-startup-abort-");
+		const stats: FakeWorkerStats = { closeRequests: 0, terminateCalls: 0 };
+		installFakeWorker(stats, { exitOnClose: true, settleRuns: true, readyDelayMs: 1_000 });
+		const session = makeSession(tempDir.path());
+		const sessionId = `js-startup-abort:${crypto.randomUUID()}`;
+		const first = executeJs("globalThis.marker = 1;", { cwd: tempDir.path(), sessionId, session });
+		await new Promise(resolve => setTimeout(resolve, 0));
+		const started = Date.now();
+		await disposeAllVmContexts();
+		const elapsed = Date.now() - started;
+		await first;
+		expect(elapsed).toBeLessThan(500);
 		expect(stats.terminateCalls).toBe(1);
 	});
 

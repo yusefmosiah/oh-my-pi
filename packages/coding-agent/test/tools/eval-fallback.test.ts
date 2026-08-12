@@ -75,6 +75,17 @@ describe("EvalTool language dispatch", () => {
 		expect(pythonExecuteSpy).not.toHaveBeenCalled();
 	});
 
+	it('dispatches to the Go backend when cell.language === "go"', async () => {
+		const goAvailableSpy = vi.spyOn(evalIndex, "getGoKernelAvailability").mockResolvedValue({ ok: true });
+		const goExecuteSpy = vi.spyOn(evalIndex.goBackend, "execute").mockResolvedValue(mockResult);
+		const settings = Settings.isolated();
+		settings.set("eval.go", true);
+		const tool = new EvalTool(makeSession(settings));
+		await tool.execute("call-go", { language: "go", code: "fmt.Println(1)" });
+		expect(goAvailableSpy).toHaveBeenCalledTimes(1);
+		expect(goExecuteSpy).toHaveBeenCalledTimes(1);
+	});
+
 	it('dispatches to the Python backend when cell.language === "py"', async () => {
 		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		vi.spyOn(evalIndex.pythonBackend, "isAvailable").mockResolvedValue(true);
@@ -140,7 +151,25 @@ describe("EvalTool language dispatch", () => {
 			js: false,
 			ruby: false,
 			julia: false,
+			go: false,
 		});
+	});
+
+	it("rejects Go cells when eval.go is disabled", async () => {
+		const tool = new EvalTool(makeSession());
+		await expect(tool.execute("call-go-disabled", { language: "go", code: "fmt.Println(1)" })).rejects.toThrow(
+			/eval\.go = false/,
+		);
+	});
+
+	it("lets PI_GO disable Go execution even when eval.go is enabled", async () => {
+		Bun.env.PI_GO = "0";
+		const settings = Settings.isolated();
+		settings.set("eval.go", true);
+		const tool = new EvalTool(makeSession(settings));
+		await expect(tool.execute("call-go-env-disabled", { language: "go", code: "fmt.Println(1)" })).rejects.toThrow(
+			/PI_GO=0/,
+		);
 	});
 
 	it("lets PI_JS disable js execution even when eval.js is enabled", async () => {

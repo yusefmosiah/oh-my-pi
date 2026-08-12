@@ -7,6 +7,7 @@ import type { Rule } from "../capability/rule";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
+import { checkGoKernelAvailability } from "../eval/go/kernel";
 import { checkJuliaKernelAvailability } from "../eval/jl/kernel";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import { checkRubyKernelAvailability } from "../eval/rb/kernel";
@@ -477,13 +478,15 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const allowJs = backends.js;
 	const allowRuby = backends.ruby;
 	const allowJulia = backends.julia;
+	const allowGo = backends.go ?? false;
 	const skipEvalPreflight = session.skipPythonPreflight === true;
 	// Eval tool is enabled if ANY backend is reachable. JS needs no preflight, so
-	// we only probe Python/Ruby/Julia when JS is disabled — otherwise allowEval is
+	// we only probe external runtimes when JS is disabled — otherwise allowEval is
 	// already true and per-backend availability is checked at first invocation.
 	let pythonAvailable = true;
 	let rubyAvailable = true;
 	let juliaAvailable = true;
+	let goAvailable = true;
 	const evalRequested = requestedTools === undefined || requestedTools.includes("eval");
 	if (!skipEvalPreflight && !allowJs && evalRequested) {
 		if (allowPython) {
@@ -518,14 +521,26 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 				logger.warn("Julia kernel unavailable and JS backend disabled", { reason: availability.reason });
 			}
 		}
+		if (allowGo) {
+			const availability = await checkGoKernelAvailability(
+				session.cwd,
+				session.settings.get("go.interpreter")?.trim() || undefined,
+			);
+			goAvailable = availability.ok;
+			if (!availability.ok) {
+				logger.warn("Go/Yaegi helper unavailable and JS backend disabled", { reason: availability.reason });
+			}
+		}
 	}
 
 	const effectivePythonAllowed = allowPython && pythonAvailable;
 	const effectiveRubyAllowed = allowRuby && rubyAvailable;
 	const effectiveJuliaAllowed = allowJulia && juliaAvailable;
+	const effectiveGoAllowed = allowGo && goAvailable;
 	// Eval is exposed whenever any backend is reachable. A backend may be
 	// unreachable, in which case eval dispatches exclusively to the others.
-	const allowEval = effectivePythonAllowed || allowJs || effectiveRubyAllowed || effectiveJuliaAllowed;
+	const allowEval =
+		effectivePythonAllowed || allowJs || effectiveRubyAllowed || effectiveJuliaAllowed || effectiveGoAllowed;
 
 	// Checkpoint and rewind are a pair: listing one without the other strands
 	// the agent (it can checkpoint but not rewind, or vice versa). Auto-include

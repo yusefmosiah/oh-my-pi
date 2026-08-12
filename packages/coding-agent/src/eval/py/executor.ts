@@ -246,10 +246,22 @@ async function replaceSessionKernel(
 	session.replacement = replacement;
 	void (async () => {
 		try {
-			const remaining = getRemainingTimeoutMs(options.deadlineMs);
-			await kernel
-				.shutdown(remaining !== undefined ? { timeoutMs: Math.max(0, remaining) } : undefined)
-				.catch(() => undefined);
+			const remaining = getRemainingTimeoutMs(replacement.deadlineMs);
+			let shutdownResult: KernelShutdownResult;
+			try {
+				shutdownResult = await kernel.shutdown(
+					remaining !== undefined ? { timeoutMs: Math.max(0, remaining) } : undefined,
+				);
+			} catch {
+				throw new PythonExecutionCancelledError(
+					replacement.deadlineMs !== undefined && replacement.deadlineMs <= Date.now(),
+				);
+			}
+			if (shutdownResult.confirmed === false) {
+				throw new PythonExecutionCancelledError(
+					replacement.deadlineMs !== undefined && replacement.deadlineMs <= Date.now(),
+				);
+			}
 			if (replacement.deadlineMs !== undefined && replacement.deadlineMs <= Date.now()) {
 				throw new PythonExecutionCancelledError(true);
 			}
@@ -263,7 +275,7 @@ async function replaceSessionKernel(
 			const next = await startKernel(cwd, {
 				...options,
 				signal: undefined,
-				deadlineMs: undefined,
+				deadlineMs: replacement.deadlineMs,
 			});
 			if (
 				context.sessions.get(session.sessionKey) !== session ||
@@ -329,7 +341,10 @@ async function executeWithKernel(
 
 async function ensureKernelAvailable(cwd: string, options: PythonExecutorOptions): Promise<void> {
 	const availability = await waitForPromiseWithCancellation(
-		checkPythonKernelAvailability(cwd, options.interpreter),
+		checkPythonKernelAvailability(cwd, options.interpreter, {
+			signal: options.signal,
+			deadlineMs: options.deadlineMs,
+		}),
 		options,
 		PythonExecutionCancelledError,
 	);
@@ -346,6 +361,11 @@ async function ensureToolBridge(options: PythonExecutorOptions): Promise<void> {
 		logger.warn("Failed to start Python tool bridge", {
 			error: err instanceof Error ? err.message : String(err),
 		});
+		// A ToolSession means the runtime is expected to have authenticated host
+		// capabilities. Do not silently continue without them: a later `omp.Tool`
+		// call would fail after user code has already started, obscuring the bridge
+		// lifecycle error and potentially leaving a partially initialized session.
+		throw err;
 	}
 }
 

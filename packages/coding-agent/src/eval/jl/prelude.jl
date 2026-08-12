@@ -72,7 +72,7 @@ end
 
 function display_image(base64_str::String, mime_type::String = "image/png")
     bundle = Dict(mime_type => base64_str)
-    Main.emit_frame(Dict("type" => "display", "id" => Main.current_rid, "bundle" => bundle))
+    Main.emit_frame(Dict("type" => "display", "id" => Main.__omp_current_run_id(), "bundle" => bundle))
     return nothing
 end
 
@@ -83,7 +83,7 @@ function __omp_emit_status(op::String, fields::AbstractDict=Dict{String, Any}())
     end
     Main.emit_frame(Dict(
         "type" => "display",
-        "id" => Main.current_rid,
+        "id" => Main.__omp_current_run_id(),
         "bundle" => Dict("application/x-omp-status" => status)
     ))
     return nothing
@@ -112,7 +112,7 @@ function Base.read(path::AbstractString, offset::Integer=1, limit::Union{Integer
     preview = length(content) > 500 ? content[1:500] : content
     Main.emit_frame(Dict(
         "type" => "display",
-        "id" => Main.current_rid,
+        "id" => Main.__omp_current_run_id(),
         "bundle" => Dict(
             "application/x-omp-status" => Dict(
                 "op" => "read",
@@ -134,7 +134,7 @@ function Base.write(path::AbstractString, content::Any)
     
     Main.emit_frame(Dict(
         "type" => "display",
-        "id" => Main.current_rid,
+        "id" => Main.__omp_current_run_id(),
         "bundle" => Dict(
             "application/x-omp-status" => Dict(
                 "op" => "write",
@@ -368,7 +368,7 @@ function env(key=nothing, value=nothing)
         keys_list = sort(collect(keys(items)))
         Main.emit_frame(Dict(
             "type" => "display",
-            "id" => Main.current_rid,
+            "id" => Main.__omp_current_run_id(),
             "bundle" => Dict(
                 "application/x-omp-status" => Dict(
                     "op" => "env",
@@ -386,7 +386,7 @@ function env(key=nothing, value=nothing)
         ENV[k] = v
         Main.emit_frame(Dict(
             "type" => "display",
-            "id" => Main.current_rid,
+            "id" => Main.__omp_current_run_id(),
             "bundle" => Dict(
                 "application/x-omp-status" => Dict(
                     "op" => "env",
@@ -402,7 +402,7 @@ function env(key=nothing, value=nothing)
     v = get(ENV, k, nothing)
     Main.emit_frame(Dict(
         "type" => "display",
-        "id" => Main.current_rid,
+        "id" => Main.__omp_current_run_id(),
         "bundle" => Dict(
             "application/x-omp-status" => Dict(
                 "op" => "env",
@@ -421,56 +421,91 @@ end
 
 using Downloads
 
-function __omp_call_bridge(name::String, args::Dict{String, Any})
-    base_url = get(ENV, "PI_TOOL_BRIDGE_URL", nothing)
-    token = get(ENV, "PI_TOOL_BRIDGE_TOKEN", nothing)
-    session = get(ENV, "PI_TOOL_BRIDGE_SESSION", nothing)
-    
-    if base_url === nothing || token === nothing || session === nothing
-        error("Tool bridge is not available in this cell.")
+# The retained runner supplies a task-local run-id accessor. Direct prelude
+# embeddings may still provide the legacy Main.__omp_current_run_id() fallback; managed
+# runners never consult that process-global binding.
+if !isdefined(Main, :__omp_current_run_id)
+    function __omp_current_run_id()
+        isdefined(Main, :current_rid) ? getfield(Main, :current_rid) : nothing
     end
-    
-    url = base_url
-    if !endswith(url, "/v1/tool")
-        url = endswith(url, "/") ? (url * "v1/tool") : (url * "/v1/tool")
-    end
+end
 
-    payload_dict = Dict(
-        "session" => session,
-        "run" => Main.current_rid,
-        "name" => name,
-        "args" => args
-    )
-    payload_json = Main.json_serialize(payload_dict)
-    
-    headers = [
-        "Authorization" => "Bearer $token",
-        "Content-Type" => "application/json"
-    ]
-    
-    io_out = IOBuffer()
-    response = Downloads.request(
-        url,
-        method="POST",
-        headers=headers,
-        input=IOBuffer(payload_json),
-        output=io_out
-    )
-    
-    resp_str = String(take!(io_out))
-    if response.status != 200
-        error("Tool bridge call failed with status $(response.status): $resp_str")
+# Bound connect/read waits so host disposal cannot leave a Julia worker blocked
+# on a loopback request indefinitely.
+const OMP_BRIDGE_TIMEOUT_SECONDS = 5 * 60
+
+# The persistent runner exposes a value-only bridge hook. Keep bridge transport
+# credentials out of user-visible globals; direct prelude embeddings retain a
+# legacy fallback for compatibility.
+const __omp_call_bridge = let bridge_hook = (isdefined(Main, :__omp_bridge_call) ? getfield(Main, :__omp_bridge_call) : nothing),
+                              legacy_credentials = Ref{Any}(nothing)
+    if bridge_hook !== nothing
+        (name::String, args::Dict{String, Any}) -> begin
+            if !haskey(args, "i") && !startswith(name, "__")
+                args["i"] = "jl prelude"
+            end
+            bridge_hook(name, args)
+        end
+    else
+        values = [get(ENV, key, nothing) for key in ("PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_TOKEN", "PI_TOOL_BRIDGE_SESSION")]
+        for key in ("PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_TOKEN", "PI_TOOL_BRIDGE_SESSION")
+            delete!(ENV, key)
+        end
+        if values[1] isa String && (values[2] === nothing || values[2] isa String) && values[3] isa String
+            legacy_credentials[] = (values[1]::String, values[2], values[3]::String)
+        end
+
+        (name::String, args::Dict{String, Any}) -> begin
+            credentials = legacy_credentials[]
+            base_url, token, session = credentials === nothing ? (nothing, nothing, nothing) : credentials
+            if base_url === nothing || session === nothing
+                error("Tool bridge is not available in this cell.")
+            end
+            # A persistent/direct caller may supply the complete tokenless
+            # broker URL. Legacy root+bearer callers keep `/v1/tool` auth.
+            url = base_url
+            if !endswith(url, "/v1/eval-tool") && !endswith(url, "/v1/tool")
+                if token !== nothing
+                    url = endswith(url, "/") ? (url * "v1/tool") : (url * "/v1/tool")
+                else
+                    url = endswith(url, "/") ? (url * "v1/eval-tool") : (url * "/v1/eval-tool")
+                end
+            end
+            if !haskey(args, "i") && !startswith(name, "__")
+                args["i"] = "jl prelude"
+            end
+            payload_dict = Dict(
+                "session" => session,
+                "run" => Main.__omp_current_run_id(),
+                "name" => name,
+                "args" => args
+            )
+            payload_json = Main.json_serialize(payload_dict)
+            headers = ["Content-Type" => "application/json"]
+            if token !== nothing
+                push!(headers, "Authorization" => "Bearer $token")
+            end
+            io_out = IOBuffer()
+            response = Downloads.request(
+                url,
+                method="POST",
+                headers=headers,
+                input=IOBuffer(payload_json),
+                output=io_out,
+                timeout=OMP_BRIDGE_TIMEOUT_SECONDS
+            )
+            resp_str = String(take!(io_out))
+            if response.status != 200
+                error("Tool bridge call failed with status $(response.status): $resp_str")
+            end
+            parsed_resp = Main.json_parse(resp_str)
+            if !get(parsed_resp, "ok", false)
+                err_msg = get(parsed_resp, "error", "Unknown error")
+                error("Tool bridge error: $err_msg")
+            end
+            get(parsed_resp, "value", nothing)
+        end
     end
-    
-    parsed_resp = Main.json_parse(resp_str)
-    
-    ok = get(parsed_resp, "ok", false)
-    if !ok
-        err_msg = get(parsed_resp, "error", "Unknown error")
-        error("Tool bridge error: $err_msg")
-    end
-    
-    return get(parsed_resp, "value", nothing)
 end
 
 struct OmpToolProxy end
@@ -490,7 +525,7 @@ function (tc::OmpToolCallable)(args...; kwargs...)
         args_dict[string(k)] = v
     end
     
-    return __omp_call_bridge("tool:" * tc.name, args_dict)
+    return __omp_call_bridge(tc.name, args_dict)
 end
 
 function Base.getproperty(::OmpToolProxy, sym::Symbol)
@@ -591,7 +626,7 @@ end
 function Base.log(message::AbstractString)
     Main.emit_frame(Dict(
         "type" => "display",
-        "id" => Main.current_rid,
+        "id" => Main.__omp_current_run_id(),
         "bundle" => Dict(
             "application/x-omp-status" => Dict(
                 "op" => "log",
@@ -605,7 +640,7 @@ end
 function phase(title::String)
     Main.emit_frame(Dict(
         "type" => "display",
-        "id" => Main.current_rid,
+        "id" => Main.__omp_current_run_id(),
         "bundle" => Dict(
             "application/x-omp-status" => Dict(
                 "op" => "phase",

@@ -3616,6 +3616,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"eval.go": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Go/Yaegi Eval Backend",
+			description: "Allow the eval tool to dispatch Go cells to the optional persistent Yaegi helper",
+		},
+	},
+
 	// Runtime knobs (consumed by eval backends and the /python slash command)
 	"python.kernelMode": {
 		type: "enum",
@@ -3659,6 +3670,17 @@ export const SETTINGS_SCHEMA = {
 			label: "Julia Interpreter",
 			description:
 				"Optional path to an exact Julia executable. When set, automatic Julia runtime discovery is skipped.",
+		},
+	},
+	"go.interpreter": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "shell",
+			group: "Eval & Runtimes",
+			label: "Yaegi Helper",
+			description:
+				"Optional path to omp-eval-go-runner (prefer an absolute path; relative paths resolve against the session cwd). When set, automatic PATH discovery is skipped.",
 		},
 	},
 

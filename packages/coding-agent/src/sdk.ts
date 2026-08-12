@@ -68,11 +68,13 @@ import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-t
 import "./discovery";
 import { initializeWithSettings } from "./discovery";
 import { withOmpExtensionRootScope } from "./discovery/omp-extension-roots";
+import { disposeAllGoKernelSessions, disposeGoKernelSessionsByOwner } from "./eval/go/executor";
 import { disposeAllJuliaKernelSessions, disposeJuliaKernelSessionsByOwner } from "./eval/jl/executor";
-import { disposeVmContextsByOwner } from "./eval/js/context-manager";
+import { disposeAllVmContexts, disposeVmContextsByOwner } from "./eval/js/context-manager";
 import { disposeAllKernelSessions, disposeKernelSessionsByOwner } from "./eval/py/executor";
 import { disposeAllRubyKernelSessions, disposeRubyKernelSessionsByOwner } from "./eval/rb/executor";
 import { defaultEvalSessionId } from "./eval/session-id";
+import { disposeToolBridge, disposeToolBridgeByOwner } from "./eval/tool-bridge";
 import {
 	type CustomCommandsLoadResult,
 	type LoadedCustomCommand,
@@ -931,6 +933,9 @@ function registerEvalCleanup(): void {
 	postmortem.register("python-cleanup", disposeAllKernelSessions);
 	postmortem.register("ruby-cleanup", disposeAllRubyKernelSessions);
 	postmortem.register("julia-cleanup", disposeAllJuliaKernelSessions);
+	postmortem.register("go-cleanup", disposeAllGoKernelSessions);
+	postmortem.register("js-cleanup", disposeAllVmContexts);
+	postmortem.register("eval-tool-bridge-cleanup", disposeToolBridge);
 }
 
 export function customToolToDefinition(tool: CustomTool): ToolDefinition {
@@ -3930,6 +3935,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				await disposeKernelSessionsByOwner(evalKernelOwnerId);
 				await disposeRubyKernelSessionsByOwner(evalKernelOwnerId);
 				await disposeJuliaKernelSessionsByOwner(evalKernelOwnerId);
+				await disposeGoKernelSessionsByOwner(evalKernelOwnerId);
+				await disposeToolBridgeByOwner(evalKernelOwnerId);
 				await disposeVmContextsByOwner(evalKernelOwnerId);
 				if (ownsAuthStorage) authStorage.close();
 			}

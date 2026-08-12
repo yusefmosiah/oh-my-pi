@@ -8,7 +8,7 @@ import {
 	StructuredSubagentError,
 	type StructuredSubagentSchemaMode,
 } from "../task/structured-subagent";
-import type { AgentProgress, SingleResult } from "../task/types";
+import type { AgentProgress, SingleResult, TaskToolDetails } from "../task/types";
 import type { NestedRepoPatch } from "../task/worktree";
 import type { ToolSession } from "../tools";
 import { ToolError } from "../tools/tool-errors";
@@ -30,6 +30,7 @@ const agentArgsSchema = type({
 	"apply?": "boolean",
 	"merge?": "boolean",
 	"handle?": "boolean",
+	"async?": "boolean",
 	"+": "delete",
 });
 
@@ -43,6 +44,7 @@ interface EvalAgentArgs {
 	apply?: boolean;
 	merge?: boolean;
 	handle?: boolean;
+	async?: boolean;
 }
 
 export interface EvalAgentBridgeOptions {
@@ -69,6 +71,8 @@ export interface EvalAgentResult {
 		nestedPatches?: NestedRepoPatch[];
 		changesApplied?: boolean | null;
 		isolationSummary?: string;
+		progress?: AgentProgress[];
+		async?: TaskToolDetails["async"];
 	};
 }
 
@@ -117,6 +121,49 @@ function buildSubagentFailureMessage(agentName: string, result: SingleResult): s
 		`agent() subagent '${agentName}' failed.`
 	);
 }
+async function runAsyncEvalAgent(parsed: EvalAgentArgs, options: EvalAgentBridgeOptions): Promise<EvalAgentResult> {
+	if (!options.session.asyncJobManager || options.session.settings.get("async.enabled") !== true) {
+		throw new ToolError("Asynchronous Go agents require async jobs to be enabled.");
+	}
+	if (parsed.apply !== undefined || parsed.merge !== undefined) {
+		throw new ToolError("Asynchronous Go agents do not support apply or merge options.");
+	}
+	const task = options.session.getToolByName?.("task");
+	if (!task) {
+		throw new ToolError("Asynchronous subagent execution is unavailable in this session.");
+	}
+	const taskArgs: Record<string, unknown> = {
+		task: parsed.prompt,
+		...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
+		...(parsed.label !== undefined ? { name: parsed.label } : {}),
+		...(parsed.schema !== undefined ? { outputSchema: parsed.schema } : {}),
+		...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
+		...(parsed.isolated !== undefined ? { isolated: parsed.isolated } : {}),
+	};
+	const taskResult = await task.execute(`go-agent-${crypto.randomUUID()}`, taskArgs, options.signal);
+	let text = "";
+	for (const part of taskResult.content) {
+		if (part.type === "text") text += `${text.length > 0 ? "\n" : ""}${part.text}`;
+	}
+	const details = taskResult.details as TaskToolDetails | undefined;
+	const progress = details?.progress;
+	const asyncDetails = details?.async;
+	const firstProgress = progress?.[0];
+	if (!firstProgress || !asyncDetails) {
+		throw new ToolError("Asynchronous Go agent did not return a background job.");
+	}
+	return {
+		text,
+		details: {
+			agent: firstProgress.agent,
+			id: firstProgress.id,
+			...(firstProgress.resolvedModel !== undefined ? { model: firstProgress.resolvedModel } : {}),
+			structured: false,
+			progress,
+			async: asyncDetails,
+		},
+	};
+}
 
 /**
  * Run a single subagent on behalf of an eval cell's `agent()` call.
@@ -129,6 +176,8 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			`agent() blocked: turn token budget exhausted (${turnBudget.spent}/${turnBudget.total} output tokens). Raise or drop the +Nk! ceiling to continue.`,
 		);
 	}
+	if (parsed.async) return runAsyncEvalAgent(parsed, options);
+
 	const isolation =
 		Object.hasOwn(parsed, "isolated") || Object.hasOwn(parsed, "apply") || Object.hasOwn(parsed, "merge")
 			? {

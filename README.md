@@ -54,6 +54,19 @@ brew install can1357/tap/omp
 bun install -g @oh-my-pi/pi-coding-agent
 ```
 
+**npm**
+
+```sh
+npm install -g @oh-my-pi/pi-coding-agent
+```
+
+The npm install still requires Bun to run the CLI. Go/Yaegi eval is optional
+and uses an external helper; npm and standalone compiled installs do not bundle
+a prebuilt helper binary. From this source checkout, `bun run go-eval -- --help`
+builds/caches the matching helper, enables `eval.go` through a temporary config
+overlay, and launches OMP in one command. If a helper is already on `PATH`, use
+`PI_GO=1 omp` instead.
+
 **Windows (PowerShell)**
 
 ```powershell
