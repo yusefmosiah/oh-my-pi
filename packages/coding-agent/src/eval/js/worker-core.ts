@@ -19,6 +19,8 @@ interface ActiveRun {
 	runId: string;
 	filename: string;
 	pendingTools: Map<string, PendingTool>;
+	/** True after a host cancel-run request; all user-visible emissions are suppressed. */
+	cancelled: boolean;
 	/** Rejections floated by this run's cell code, captured before its result was sent. */
 	floatingRejections: unknown[];
 }
@@ -221,6 +223,9 @@ export class WorkerCore {
 			case "tool-reply":
 				this.#deliverToolReply(msg.id, msg.reply);
 				return;
+			case "cancel-run":
+				this.#cancelRun(msg.runId, msg.error);
+				return;
 			case "close":
 				this.#close();
 				return;
@@ -277,11 +282,23 @@ export class WorkerCore {
 	}
 
 	async #runOne(runId: string, code: string, filename: string, snapshot: SessionSnapshot): Promise<void> {
-		const active: ActiveRun = { runId, filename, pendingTools: new Map(), floatingRejections: [] };
+		const active: ActiveRun = {
+			runId,
+			filename,
+			pendingTools: new Map(),
+			cancelled: false,
+			floatingRejections: [],
+		};
 		this.#runs.set(runId, active);
 		const hooks: RuntimeHooks = {
-			onText: chunk => this.#transport.send({ type: "text", runId, chunk }),
-			onDisplay: output => this.#transport.send({ type: "display", runId, output }),
+			onText: chunk => {
+				if (active.cancelled) return;
+				this.#transport.send({ type: "text", runId, chunk });
+			},
+			onDisplay: output => {
+				if (active.cancelled) return;
+				this.#transport.send({ type: "display", runId, output });
+			},
 			callTool: (name, args) => this.#callTool(active, name, args),
 		};
 		let result: RunResult;
@@ -303,7 +320,10 @@ export class WorkerCore {
 		} finally {
 			this.#runs.delete(runId);
 			this.#rememberCellFile(filename);
-			this.#transport.send(result);
+			// A canceled run has already been rejected on the host side. Do not send
+			// a late result (or any folded rejection output) that could race a
+			// replacement cell on a worker shared by another owner.
+			if (!active.cancelled) this.#transport.send(result);
 		}
 	}
 
@@ -317,11 +337,17 @@ export class WorkerCore {
 	}
 
 	async #callTool(active: ActiveRun, name: string, args: unknown): Promise<unknown> {
+		if (active.cancelled) throw new ToolError("JS eval run cancelled");
 		const id = `tc-${active.runId}-${crypto.randomUUID()}`;
 		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
 		active.pendingTools.set(id, { runId: active.runId, resolve, reject });
 		try {
-			this.#transport.send({ type: "tool-call", id, runId: active.runId, name, args });
+			if (active.cancelled) {
+				active.pendingTools.delete(id);
+				reject(new ToolError("JS eval run cancelled"));
+			} else {
+				this.#transport.send({ type: "tool-call", id, runId: active.runId, name, args });
+			}
 		} catch (error) {
 			// Non-serializable args (DataCloneError from postMessage / IPC send).
 			// No reply will ever arrive; fail this call instead of stranding a
@@ -330,6 +356,21 @@ export class WorkerCore {
 			reject(error);
 		}
 		return await promise;
+	}
+
+	#cancelRun(runId: string, payload?: RunErrorPayload): void {
+		const active = this.#runs.get(runId);
+		if (!active || active.cancelled) return;
+		active.cancelled = true;
+		const error = errorFromPayload(
+			payload ?? {
+				name: "AbortError",
+				message: "JS eval run cancelled",
+				isAbort: true,
+			},
+		);
+		for (const pending of active.pendingTools.values()) pending.reject(error);
+		active.pendingTools.clear();
 	}
 
 	#deliverToolReply(id: string, reply: ToolReply): void {
@@ -345,6 +386,7 @@ export class WorkerCore {
 
 	#close(): void {
 		for (const active of this.#runs.values()) {
+			active.cancelled = true;
 			for (const pending of active.pendingTools.values()) {
 				pending.reject(new ToolError("JS worker closed"));
 			}
@@ -361,6 +403,7 @@ export class WorkerCore {
 
 	dispose(): void {
 		for (const active of this.#runs.values()) {
+			active.cancelled = true;
 			for (const pending of active.pendingTools.values()) {
 				pending.reject(new ToolError("JS worker closed"));
 			}

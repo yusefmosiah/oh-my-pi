@@ -171,7 +171,13 @@ async function executeWithKernel(
 }
 
 async function ensureKernelAvailable(cwd: string, options: JuliaExecutorOptions): Promise<void> {
-	const availability = await waitForJuliaPromise(checkJuliaKernelAvailability(cwd, options.interpreter), options);
+	const availability = await waitForJuliaPromise(
+		checkJuliaKernelAvailability(cwd, options.interpreter, {
+			signal: options.signal,
+			deadlineMs: options.deadlineMs,
+		}),
+		options,
+	);
 	if (!availability.ok) {
 		throw new Error(availability.reason ?? "Julia kernel unavailable");
 	}
@@ -185,6 +191,11 @@ async function ensureToolBridge(options: JuliaExecutorOptions): Promise<void> {
 		logger.warn("Failed to start Julia tool bridge", {
 			error: err instanceof Error ? err.message : String(err),
 		});
+		// A ToolSession means the runtime is expected to have authenticated host
+		// capabilities. Do not silently continue without them: a later `omp.Tool`
+		// call would fail after user code has already started, obscuring the bridge
+		// lifecycle error and potentially leaving a partially initialized session.
+		throw err;
 	}
 }
 
@@ -204,6 +215,7 @@ const sessionRegistry = createKernelSessionRegistry<
 	createSession: session => session,
 	startKernel,
 	executeWithKernel,
+	validateKernel: (session, kernel) => session.kernel === kernel,
 	waitForStartup: waitForJuliaPromise,
 	shutdownSession: (session, resetting) =>
 		resetting ? session.kernel.shutdown({ timeoutMs: SHUTDOWN_GRACE_MS }) : session.kernel.shutdown(),

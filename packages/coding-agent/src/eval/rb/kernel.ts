@@ -10,9 +10,19 @@
  */
 import * as path from "node:path";
 import { $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
-import { $ } from "bun";
 import { Settings } from "../../config/settings";
-import { BaseKernel, getRemainingTimeMs, type KernelRuntimeEnv, type KernelStartOptions } from "../kernel-base";
+import {
+	BaseKernel,
+	cacheKernelAvailabilityProbe,
+	createAbortError,
+	getCachedKernelAvailability,
+	getRemainingTimeMs,
+	type KernelAvailabilityCacheEntry,
+	type KernelRuntimeEnv,
+	type KernelStartOptions,
+	runKernelProbe,
+	throwIfAborted,
+} from "../kernel-base";
 import type { KernelDisplayOutput } from "../py/display";
 import { hostHasInheritableConsole, shouldDetachKernel, shouldHideKernelWindow } from "../py/spawn-options";
 import { stageRunnerScript } from "../runner-cache";
@@ -37,6 +47,7 @@ const STARTUP_TIMEOUT_MS = 10_000;
 // How long to wait after SIGINT for the runner to emit `done` before escalating
 // to a full subprocess shutdown so the host queue unblocks instead of hanging.
 const INTERRUPT_ESCALATION_MS = 5_000;
+const BRIDGE_ENV_KEYS = ["PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_TOKEN", "PI_TOOL_BRIDGE_SESSION"] as const;
 
 export interface KernelExecuteOptions {
 	id?: string;
@@ -62,26 +73,34 @@ export interface RubyKernelAvailability {
 
 // Cache successful probes per resolved cwd + explicit interpreter. Failures are
 // not cached so installing Ruby mid-session is picked up on the next attempt.
-const availabilityCache = new Map<string, Promise<RubyKernelAvailability>>();
+const availabilityCache = new Map<string, KernelAvailabilityCacheEntry<RubyKernelAvailability>>();
 
-export async function checkRubyKernelAvailability(cwd: string, interpreter?: string): Promise<RubyKernelAvailability> {
-	if (isBunTestRuntime() || $flag("PI_RUBY_SKIP_CHECK")) {
+export async function checkRubyKernelAvailability(
+	cwd: string,
+	interpreter?: string,
+	options?: { forceProbe?: boolean; signal?: AbortSignal; deadlineMs?: number },
+): Promise<RubyKernelAvailability> {
+	throwIfAborted(options?.signal, "Ruby kernel availability probe cancelled");
+	if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now())
+		throw createAbortError("TimeoutError", "Ruby kernel availability probe timed out");
+	if (!options?.forceProbe && (isBunTestRuntime() || $flag("PI_RUBY_SKIP_CHECK"))) {
 		return { ok: true };
 	}
 	const resolvedCwd = path.resolve(cwd);
 	const key = `${resolvedCwd}\0${interpreter ?? ""}`;
-	const cached = availabilityCache.get(key);
+	const cacheable = !options?.forceProbe && options?.signal === undefined && options?.deadlineMs === undefined;
+	const cached = cacheable ? getCachedKernelAvailability(availabilityCache, key) : undefined;
 	if (cached) return await cached;
-	const probe = probeRubyKernelAvailability(resolvedCwd, interpreter);
-	availabilityCache.set(key, probe);
-	const result = await probe;
-	if (!result.ok && availabilityCache.get(key) === probe) {
-		availabilityCache.delete(key);
-	}
-	return result;
+	const probe = probeRubyKernelAvailability(resolvedCwd, interpreter, options);
+	if (cacheable) cacheKernelAvailabilityProbe(availabilityCache, key, probe);
+	return await probe;
 }
 
-async function probeRubyKernelAvailability(cwd: string, interpreter?: string): Promise<RubyKernelAvailability> {
+async function probeRubyKernelAvailability(
+	cwd: string,
+	interpreter?: string,
+	options?: { signal?: AbortSignal; deadlineMs?: number },
+): Promise<RubyKernelAvailability> {
 	try {
 		const settings = await Settings.init();
 		const { env } = settings.getShellConfig();
@@ -93,14 +112,32 @@ async function probeRubyKernelAvailability(cwd: string, interpreter?: string): P
 		const failures: string[] = [];
 		for (const runtime of runtimes) {
 			try {
-				const probe = await $`${runtime.rubyPath} -e ${"exit 0"}`.quiet().nothrow().cwd(cwd).env(runtime.env);
-				if (probe.exitCode === 0) {
+				// Availability must not hang on a PATH shim. Caller deadlines remain
+				// authoritative; the five-second guard is an internal candidate failure.
+				const probeDeadline = Math.min(options?.deadlineMs ?? Number.POSITIVE_INFINITY, Date.now() + 5_000);
+				const exitCode = await runKernelProbe([runtime.rubyPath, "-e", "exit 0"], {
+					cwd,
+					env: runtime.env,
+					signal: options?.signal,
+					deadlineMs: probeDeadline,
+					label: "Ruby",
+				});
+				if (exitCode === 0) {
 					return { ok: true, rubyPath: runtime.rubyPath, runtime };
 				}
-				failures.push(`${runtime.rubyPath} (exit code ${probe.exitCode})`);
+				failures.push(`${runtime.rubyPath} (exit code ${exitCode})`);
 			} catch (err) {
+				if (options?.signal?.aborted) throwIfAborted(options.signal, "Ruby kernel probe cancelled");
+				throwIfAborted(options?.signal, "Ruby kernel probe cancelled");
+				if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now()) {
+					throw createAbortError("TimeoutError", "Ruby kernel probe timed out");
+				}
 				failures.push(`${runtime.rubyPath} (${err instanceof Error ? err.message : String(err)})`);
 			}
+		}
+		throwIfAborted(options?.signal, "Ruby kernel probe cancelled");
+		if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now()) {
+			throw createAbortError("TimeoutError", "Ruby kernel probe timed out");
 		}
 		return {
 			ok: false,
@@ -108,6 +145,11 @@ async function probeRubyKernelAvailability(cwd: string, interpreter?: string): P
 			reason: `No working Ruby interpreter found. Tried: ${failures.join("; ")}`,
 		};
 	} catch (err) {
+		if (options?.signal?.aborted) throwIfAborted(options.signal, "Ruby kernel probe cancelled");
+		throwIfAborted(options?.signal, "Ruby kernel probe cancelled");
+		if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now()) {
+			throw createAbortError("TimeoutError", "Ruby kernel probe timed out");
+		}
 		return { ok: false, reason: err instanceof Error ? err.message : String(err) };
 	}
 }
@@ -138,10 +180,14 @@ export class RubyKernel extends BaseKernel<KernelExecuteOptions> {
 			checkRubyKernelAvailability,
 			options.cwd,
 			options.interpreter,
+			{ signal: options.signal, deadlineMs: options.deadlineMs },
 		);
 		if (!availability.ok) {
 			throw new Error(availability.reason ?? "Ruby kernel unavailable");
 		}
+		throwIfAborted(options.signal, "Ruby kernel startup cancelled");
+		if (options.deadlineMs !== undefined && options.deadlineMs <= Date.now())
+			throw createAbortError("TimeoutError", "Ruby kernel startup timed out");
 
 		// Reuse the interpreter the availability probe selected. The fallback
 		// computes a runtime only for the skip-check fast path (test runtime /
@@ -162,7 +208,11 @@ export class RubyKernel extends BaseKernel<KernelExecuteOptions> {
 			const value = options.env[key];
 			if (typeof value === "string") spawnEnv[key] = value;
 		}
+		// Bridge credentials arrive on the request wire and are captured by the runner;
+		// never inherit them in the process environment.
+		for (const key of BRIDGE_ENV_KEYS) delete spawnEnv[key];
 
+		throwIfAborted(options.signal, "Ruby kernel startup cancelled");
 		const scriptPath = await stageRunnerScript("omp-ruby-runner", "rb", RUNNER_SCRIPT);
 		const kernel = new RubyKernel(Snowflake.next());
 
@@ -181,12 +231,13 @@ export class RubyKernel extends BaseKernel<KernelExecuteOptions> {
 		kernel.setProcess(proc);
 
 		const startup = { signal: options.signal, deadlineMs: options.deadlineMs };
-		const startupBudget = Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
 
 		try {
 			const initScript = buildInitScript(options.cwd, options.env);
-			await kernel.executeWithBudget(initScript, startup.signal, startupBudget, "Ruby kernel init");
-			await kernel.executeWithBudget(RUBY_PRELUDE, startup.signal, startupBudget, "Ruby kernel prelude");
+			const phaseBudget = () =>
+				Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
+			await kernel.executeWithBudget(initScript, startup.signal, phaseBudget(), "Ruby kernel init");
+			await kernel.executeWithBudget(RUBY_PRELUDE, startup.signal, phaseBudget(), "Ruby kernel prelude");
 			return kernel;
 		} catch (err) {
 			await kernel.shutdown({ timeoutMs: SHUTDOWN_GRACE_MS }).catch(() => {});
@@ -199,7 +250,8 @@ function buildInitScript(cwd: string, env?: Record<string, string | undefined>):
 	const envPayload: Record<string, string> = {};
 	for (const key in env) {
 		const value = env[key];
-		if (value !== undefined) envPayload[key] = value;
+		if (value !== undefined && !BRIDGE_ENV_KEYS.includes(key as (typeof BRIDGE_ENV_KEYS)[number]))
+			envPayload[key] = value;
 	}
 	// JSON string literals are valid Ruby string literals. Emit one
 	// `ENV["k"] = "v"` per key — a `{"k":"v"}` object literal would parse as a

@@ -530,4 +530,17 @@ describe("executeJs", () => {
 		expect(result.exitCode).toBeUndefined();
 		expect(result.output).toContain("Command timed out");
 	});
+
+	it("treats a non-positive timeout as already expired", async () => {
+		const result = await executeJs("await new Promise(() => {})", {
+			sessionId,
+			session,
+			sessionFile,
+			timeoutMs: 0,
+		});
+
+		expect(result.cancelled).toBe(true);
+		expect(result.exitCode).toBeUndefined();
+		expect(result.output).toContain("Command timed out");
+	});
 });

@@ -42,12 +42,16 @@ import runpy
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
@@ -177,6 +181,14 @@ class _RunnerState:
     def __init__(self) -> None:
         self.execution_count: int = 0
         self.cancel_requested: bool = False
+        # Bridge credentials are request-scoped runner state, never part of the
+        # user-visible environment. Keeping the bearer token out of os.environ
+        # also prevents subprocesses and the env() helper from inheriting it.
+        self.bridge_url: str | None = None
+        # Legacy direct embeddings may still provide a bearer for /v1/tool;
+        # retained kernels use the tokenless /v1/eval-tool URL and leave this None.
+        self.bridge_token: str | None = None
+        self.bridge_session: str | None = None
         # User globals — kept across requests when running in session mode.
         self.user_ns: dict[str, Any] = {
             "__name__": "__main__",
@@ -204,6 +216,77 @@ _CURRENT_DISPLAYED_MATPLOTLIB_FIGURE_IDS: contextvars.ContextVar[set[int] | None
 
 
 _STATE = _RunnerState()
+
+# These values are delivered in the per-request protocol payload. Scrub any
+# inherited copy before runner startup/imports so a user process never receives
+# credentials merely because the host had them in its spawn environment.
+_BRIDGE_ENV_KEYS = (
+    "PI_TOOL_BRIDGE_URL",
+    "PI_TOOL_BRIDGE_TOKEN",
+    "PI_TOOL_BRIDGE_SESSION",
+)
+for _bridge_key in _BRIDGE_ENV_KEYS:
+    os.environ.pop(_bridge_key, None)
+
+
+def _get_bridge_endpoint() -> tuple[str | None, str | None, str | None]:
+    """Return the endpoint, optional legacy bearer, and run scope.
+
+    Retained kernels receive a complete ``/v1/eval-tool`` URL and no bearer.
+    Direct/legacy callers may still provide a host-only URL plus a token for
+    the authenticated ``/v1/tool`` route.
+    """
+    return (_STATE.bridge_url, _STATE.bridge_token, _STATE.bridge_session)
+
+
+def _resolve_bridge_endpoint(base: str, token: str | None) -> str:
+    """Complete a broker URL, selecting legacy auth only when a token exists."""
+    parsed = urlsplit(base)
+    if parsed.path in ("", "/"):
+        path = "/v1/tool" if token else "/v1/eval-tool"
+        return urlunsplit(parsed._replace(path=path))
+    return base
+
+
+_BRIDGE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_BRIDGE_TIMEOUT_SECONDS = 5 * 60
+
+
+def _bridge_call_from_runner(name: str, args: dict) -> Any:
+    """Call the host-side broker with an optional legacy authentication bearer."""
+    base, token, session = _get_bridge_endpoint()
+    if not base or not session:
+        raise RuntimeError("tool bridge is unavailable in this kernel")
+    payload = json.dumps(
+        {"session": session, "run": _CURRENT_RID.get(), "name": name, "args": args}
+    ).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(
+        _resolve_bridge_endpoint(base, token),
+        data=payload,
+        method="POST",
+        headers=headers,
+    )
+
+    try:
+        with _BRIDGE_OPENER.open(req, timeout=_BRIDGE_TIMEOUT_SECONDS) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+    except (socket.timeout, TimeoutError) as exc:
+        raise RuntimeError(f"bridge call {name!r} timed out after {_BRIDGE_TIMEOUT_SECONDS:g}s") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"bridge call {name!r} transport failed: {exc.reason}") from exc
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"bridge call {name!r}: non-JSON response: {body[:200]!r}") from None
+    if not isinstance(data, dict) or not data.get("ok"):
+        msg = (data or {}).get("error") if isinstance(data, dict) else None
+        raise RuntimeError(msg or f"bridge call {name!r} failed")
+    return data.get("value")
 
 
 def _drain_captured_stdout() -> None:
@@ -1037,6 +1120,9 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 def _install_builtins(ns: dict) -> None:
     ns["display"] = __omp_display
     ns["__omp_display"] = __omp_display
+    # Bound by the prelude at load time, then removed from the user namespace.
+    # The hook returns only the host value; credentials stay in runner state.
+    ns["__omp_bridge_call__"] = _bridge_call_from_runner
     ns["__omp_magic"] = __omp_magic
     ns["__omp_magic_cell"] = __omp_magic_cell
     ns["__omp_shell"] = __omp_shell
@@ -1180,6 +1266,14 @@ _MANAGED_ENV_KEYS = (
 
 
 def _apply_request_runtime(req: dict) -> None:
+    # Reset credentials before every request. Julia uses sparse env patches and
+    # a missing key therefore means "no bridge" rather than "reuse old token".
+    _STATE.bridge_url = None
+    _STATE.bridge_token = None
+    _STATE.bridge_session = None
+    for key in _BRIDGE_ENV_KEYS:
+        os.environ.pop(key, None)
+
     cwd = req.get("cwd")
     if isinstance(cwd, str) and cwd:
         os.chdir(cwd)
@@ -1193,10 +1287,32 @@ def _apply_request_runtime(req: dict) -> None:
     if isinstance(env, dict):
         for key in _MANAGED_ENV_KEYS:
             value = env.get(key)
+            if key == "PI_TOOL_BRIDGE_URL":
+                _STATE.bridge_url = value if isinstance(value, str) else None
+                continue
+            if key == "PI_TOOL_BRIDGE_TOKEN":
+                # Never retain a bearer from a persistent request. The host-side
+                # capability broker is tokenless; legacy bearer support belongs
+                # only to direct PYTHON_PRELUDE embeddings, not this runner.
+                _STATE.bridge_token = None
+                continue
+            if key == "PI_TOOL_BRIDGE_SESSION":
+                _STATE.bridge_session = value if isinstance(value, str) else None
+                continue
             if isinstance(value, str):
                 os.environ[key] = value
             elif value is None:
                 os.environ.pop(key, None)
+
+    # The retained-runtime broker route is deliberately bearerless. Even if a
+    # stale host/request payload still contains the old token field, do not
+    # retain it where user introspection could reach it.
+    if _STATE.bridge_url:
+        try:
+            if urlsplit(_STATE.bridge_url).path.rstrip("/") == "/v1/eval-tool":
+                _STATE.bridge_token = None
+        except ValueError:
+            _STATE.bridge_token = None
 
 
 def _start_parent_watchdog() -> None:
@@ -1280,6 +1396,11 @@ async def _handle_request_async(req: dict) -> None:
         _begin_exec_sigint()
         try:
             await _exec_source_async(transformed, _STATE.user_ns)
+            # The prelude captures the runner hook in a closure. Remove the hook
+            # from globals before any user cell can enumerate it.
+            if _STATE.user_ns.get("__omp_prelude_loaded__"):
+                _STATE.user_ns.pop("__omp_get_bridge_credentials__", None)
+                _STATE.user_ns.pop("__omp_bridge_call__", None)
         except KeyboardInterrupt:
             cancelled = True
             status = "error"
@@ -1407,9 +1528,11 @@ async def _main_async() -> None:
             req = await queue.get()
             if req.get("type") == "exit":
                 break
-            task = asyncio.create_task(_handle_request_async(req))
-            tasks.add(task)
-            task.add_done_callback(_task_done)
+            # The interpreter, cwd, environment, capture routing, and SIGINT
+            # handler are process-global. Execute one cell at a time; allowing
+            # independent tasks here would let co-owner requests corrupt one
+            # another and make process-wide SIGINT cancel the wrong cell.
+            await _handle_request_async(req)
     finally:
         for task in tasks:
             task.cancel()

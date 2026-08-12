@@ -35,6 +35,11 @@ $__omp_capture_rid = nil
 $__omp_exec_count = 0
 $__omp_active_exec = 0
 $__omp_silent = false
+# Bridge credentials are request-scoped state owned by OmpBridge after its
+# prelude is loaded. They are intentionally not kept in ENV or runner globals,
+# which user code and child processes can inspect or inherit.
+OMP_BRIDGE_ENV_KEYS = %w[PI_TOOL_BRIDGE_URL PI_TOOL_BRIDGE_TOKEN PI_TOOL_BRIDGE_SESSION].freeze
+OMP_BRIDGE_ENV_KEYS.each { |key| ENV.delete(key) }
 
 begin
   $__omp_frame_io = STDOUT.dup
@@ -105,7 +110,7 @@ rescue StandardError
 end
 
 def __omp_run_id
-  $__omp_current_rid
+  Thread.current[:__omp_bridge_run] || $__omp_current_rid
 end
 
 def __omp_emit_stream(kind, text)
@@ -422,6 +427,10 @@ OMP_MANAGED_ENV_KEYS = %w[
 ].freeze
 
 def __omp_apply_request_runtime(req)
+  # Reset every request so sparse patches cannot reuse an old bearer token.
+  bridge_values = [nil, nil, nil]
+  OMP_BRIDGE_ENV_KEYS.each { |key| ENV.delete(key) }
+
   cwd = req["cwd"]
   if cwd.is_a?(String) && !cwd.empty?
     (Dir.chdir(cwd) rescue nil)
@@ -433,12 +442,27 @@ def __omp_apply_request_runtime(req)
     OMP_MANAGED_ENV_KEYS.each do |key|
       next unless env.key?(key)
       value = env[key]
-      if value.is_a?(String)
+      if OMP_BRIDGE_ENV_KEYS.include?(key)
+        if value.is_a?(String)
+          case key
+          when "PI_TOOL_BRIDGE_URL" then bridge_values[0] = value
+          # The authenticated bearer belongs to the host broker. Ignore even
+          # legacy/request-supplied copies in this retained interpreter.
+          when "PI_TOOL_BRIDGE_TOKEN" then nil
+          when "PI_TOOL_BRIDGE_SESSION" then bridge_values[2] = value
+          end
+        end
+        # Never mirror bridge credentials into the user-visible process ENV.
+        ENV.delete(key)
+      elsif value.is_a?(String)
         ENV[key] = value
       elsif value.nil?
         ENV.delete(key)
       end
     end
+  end
+  if defined?(OmpBridge) && OmpBridge.respond_to?(:__omp_set_bridge_credentials, true)
+    OmpBridge.send(:__omp_set_bridge_credentials, bridge_values)
   end
 end
 
@@ -500,6 +524,7 @@ end
 def __omp_handle_request(req)
   rid = req["id"].to_s
   $__omp_current_rid = rid
+  Thread.current[:__omp_bridge_run] = rid
   $__omp_capture_rid = rid
   $__omp_silent = req["silent"] == true
   $__omp_exec_count += 1
@@ -542,6 +567,7 @@ def __omp_handle_request(req)
   ensure
     $__omp_capture_rid = nil if $__omp_capture_rid == rid
     $__omp_current_rid = nil
+    Thread.current[:__omp_bridge_run] = nil if Thread.current[:__omp_bridge_run] == rid
   end
 end
 

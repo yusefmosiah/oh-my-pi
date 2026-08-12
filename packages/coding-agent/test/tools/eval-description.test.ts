@@ -67,7 +67,7 @@ describe("eval tool description", () => {
 describe("eval tool dynamic schema", () => {
 	// resolveEvalBackends lets PI_* env flags override settings; neutralize them per-test
 	// so the schema is driven purely by the isolated settings (and restore to avoid leaks).
-	const EVAL_ENV_FLAGS = ["PI_PY", "PI_JS", "PI_RB", "PI_JL"] as const;
+	const EVAL_ENV_FLAGS = ["PI_PY", "PI_JS", "PI_RB", "PI_JL", "PI_GO"] as const;
 	let savedEnv: Record<string, string | undefined>;
 	beforeEach(() => {
 		savedEnv = {};
@@ -124,5 +124,27 @@ describe("eval tool dynamic schema", () => {
 		expect(tool.summary).toBe("Execute Python, JavaScript, or Ruby code in a persistent eval backend");
 		expect(tool.description).toMatch(/ruby/i);
 		expect(tool.description).not.toMatch(/julia/i);
+	});
+
+	it("advertises Go/Yaegi only when eval.go is enabled", () => {
+		const disabled = wireCellFields(new EvalTool(makeSession({})));
+		expect(disabled.languages).not.toContain("go");
+		const enabled = wireCellFields(new EvalTool(makeSession({ backends: { "eval.go": true } })));
+		expect(enabled.languages).toEqual(["go", "js", "py"]);
+		expect(enabled.languageDescription).toContain('"go" for the persistent Go/Yaegi kernel');
+		expect(enabled.codeDescription).toContain("go auto-display the last expression like a REPL");
+	});
+
+	it("advertises no languages when every eval backend is disabled", () => {
+		const tool = new EvalTool(
+			makeSession({
+				backends: { "eval.py": false, "eval.js": false, "eval.rb": false, "eval.jl": false, "eval.go": false },
+			}),
+		);
+		const fields = wireCellFields(tool);
+		// An empty ArkType enum serializes to a `not` schema, rather than
+		// re-advertising disabled runtimes through the static fallback union.
+		expect(fields.languages).toEqual([]);
+		expect(tool.description).not.toMatch(/Python|JavaScript|Ruby|Julia|Go\/Yaegi/);
 	});
 });

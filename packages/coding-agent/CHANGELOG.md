@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Fixed Go eval `omp.Agent` calls returning only after completion; Go agents now launch as background jobs and can be coordinated through `omp.Hub`.
+
 
 ## [17.2.14] - 2026-08-11
 

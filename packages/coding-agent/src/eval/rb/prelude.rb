@@ -5,7 +5,7 @@
 # (display/read/write/env/output, the `tool` bridge proxy,
 # completion/agent/parallel/pipeline/log/phase/budget). Host-side helpers reach
 # the coding-agent over the same loopback HTTP tool bridge the Python prelude
-# uses (PI_TOOL_BRIDGE_URL/TOKEN/SESSION). Path helpers honor PI_EVAL_LOCAL_ROOTS
+# uses a runner-private credential hook (never user-visible ENV). Path helpers honor PI_EVAL_LOCAL_ROOTS
 # so `write("local://x")` lands where `read local://x` resolves.
 #
 # `__omp_*` primitives (emit/present/status/scrub/run_id) are provided by
@@ -279,31 +279,61 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
 
   module OmpBridge
     INTENT_FIELD = "i"
+    # Bound connect/read waits so a disposed host cannot strand the Ruby
+    # interpreter on a loopback request forever.
+    BRIDGE_TIMEOUT_SECONDS = 5 * 60
 
     module_function
 
+    # Runner updates this module-private slot each request. Direct prelude
+    # embeddings capture/scrub legacy ENV at load instead.
+    @bridge_credentials = nil
+    captured = [ENV["PI_TOOL_BRIDGE_URL"], ENV["PI_TOOL_BRIDGE_TOKEN"], ENV["PI_TOOL_BRIDGE_SESSION"]]
+    ["PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_TOKEN", "PI_TOOL_BRIDGE_SESSION"].each { |key| ENV.delete(key) }
+    @bridge_credentials = captured if captured.any? { |value| value }
+
+    def __omp_set_bridge_credentials(values)
+      @bridge_credentials = values
+    end
+    private_class_method :__omp_set_bridge_credentials
+
     def proxy_env
-      base = ENV["PI_TOOL_BRIDGE_URL"]
-      token = ENV["PI_TOOL_BRIDGE_TOKEN"]
-      session = ENV["PI_TOOL_BRIDGE_SESSION"]
-      if base.nil? || base.empty? || token.nil? || token.empty? || session.nil? || session.empty?
+      values = @bridge_credentials
+      base, token, session = values
+      if base.nil? || base.empty? || session.nil? || session.empty?
         raise "tool bridge is unavailable in this kernel"
       end
       [base.sub(%r{/+\z}, ""), token, session]
     end
 
+    private_class_method :proxy_env
+
     def call(name, args)
       require "net/http"
       require "uri"
       base, token, session = proxy_env
-      uri = URI("#{base}/v1/tool")
-      payload = JSON.generate("session" => session, "run" => $__omp_current_rid, "name" => name, "args" => args)
+      # Retained runners receive the complete tokenless broker URL. The legacy
+      # prelude-only embedding still accepts a root URL plus bearer and uses the
+      # authenticated endpoint for compatibility.
+      endpoint =
+        if base.end_with?("/v1/eval-tool") || base.end_with?("/v1/tool")
+          base
+        elsif token && !token.empty?
+          "#{base}/v1/tool"
+        else
+          "#{base}/v1/eval-tool"
+        end
+      uri = URI(endpoint)
+      run_id = Thread.current[:__omp_bridge_run]
+      raise "tool bridge is unavailable outside the active eval cell" if run_id.nil? || run_id.empty?
+      payload = JSON.generate("session" => session, "run" => run_id, "name" => name, "args" => args)
       http = Net::HTTP.new(uri.hostname, uri.port)
-      http.open_timeout = 10
-      http.read_timeout = 7 * 24 * 3600
+      http.open_timeout = BRIDGE_TIMEOUT_SECONDS
+      http.read_timeout = BRIDGE_TIMEOUT_SECONDS
+      http.write_timeout = BRIDGE_TIMEOUT_SECONDS if http.respond_to?(:write_timeout=)
       req = Net::HTTP::Post.new(uri)
       req["Content-Type"] = "application/json"
-      req["Authorization"] = "Bearer #{token}"
+      req["Authorization"] = "Bearer #{token}" if token && !token.empty?
       req.body = payload
       resp = http.request(req)
       data =
@@ -374,8 +404,7 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
     end
 
     def inspect
-      session = ::ENV["PI_TOOL_BRIDGE_SESSION"]
-      session ? "#<tool proxy session=#{session}>" : "#<tool proxy unavailable>"
+      "#<tool proxy>"
     end
   end
 
@@ -548,4 +577,5 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
   def budget
     $__omp_budget ||= OmpBudget.new
   end
+
 end

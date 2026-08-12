@@ -10,6 +10,9 @@ it("imports the CLI entry graph without loading dotenv before profile bootstrap"
 		Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
 	);
 	delete env.OMP_PROCESS_ENTRY_ENV_PROBE;
+	// Keep Bun's child stderr deterministic when the test runner forces color.
+	delete env.FORCE_COLOR;
+	delete env.NO_COLOR;
 	env.HOME = tempDir.path();
 	const fixture = path.resolve(import.meta.dir, "../fixtures/js-process-entry-import.ts");
 	const proc = Bun.spawn([process.execPath, fixture], {

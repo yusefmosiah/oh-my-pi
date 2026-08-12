@@ -360,6 +360,9 @@ export function createWorkerHandle<Inbound, Outbound>(
 			} catch {
 				// Already gone.
 			}
+			// Do not report teardown complete until the child has actually exited;
+			// callers use terminate as a lifecycle barrier before replacing a worker.
+			await proc.exited.catch(() => undefined);
 		},
 	};
 }

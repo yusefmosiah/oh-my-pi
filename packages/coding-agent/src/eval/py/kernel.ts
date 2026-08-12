@@ -9,9 +9,18 @@
  */
 import * as path from "node:path";
 import { $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
-import { $ } from "bun";
 import { Settings } from "../../config/settings";
-import { BaseKernel, getRemainingTimeMs, type KernelStartOptions } from "../kernel-base";
+import {
+	BaseKernel,
+	cacheKernelAvailabilityProbe,
+	createAbortError,
+	getCachedKernelAvailability,
+	getRemainingTimeMs,
+	type KernelAvailabilityCacheEntry,
+	type KernelStartOptions,
+	runKernelProbe,
+	throwIfAborted,
+} from "../kernel-base";
 import { stageRunnerScript } from "../runner-cache";
 import { PYTHON_PRELUDE } from "./prelude";
 import RUNNER_SCRIPT from "./runner.py" with { type: "text" };
@@ -46,6 +55,7 @@ const STARTUP_TIMEOUT_MS = 10_000;
 // generous: a clean interrupt is far preferable to losing the persistent
 // kernel's state, so we only kill as a last-resort recovery path.
 const INTERRUPT_ESCALATION_MS = 5_000;
+const BRIDGE_ENV_KEYS = ["PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_TOKEN", "PI_TOOL_BRIDGE_SESSION"] as const;
 
 export interface PythonKernelAvailability {
 	ok: boolean;
@@ -59,30 +69,36 @@ export interface PythonKernelAvailability {
 // otherwise pays one (or two — backend.isAvailable + ensureKernelAvailable)
 // interpreter spawns even when the kernel is already hot. Failures are not
 // cached so installing a Python mid-session is picked up on the next attempt.
-const availabilityCache = new Map<string, Promise<PythonKernelAvailability>>();
+const availabilityCache = new Map<string, KernelAvailabilityCacheEntry<PythonKernelAvailability>>();
 
 export async function checkPythonKernelAvailability(
 	cwd: string,
 	interpreter?: string,
-	options?: { forceProbe?: boolean },
+	options?: { forceProbe?: boolean; signal?: AbortSignal; deadlineMs?: number },
 ): Promise<PythonKernelAvailability> {
+	throwIfAborted(options?.signal, "Python kernel availability probe cancelled");
+	if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now())
+		throw createAbortError("TimeoutError", "Python kernel availability probe timed out");
 	if (!options?.forceProbe && (isBunTestRuntime() || $flag("PI_PYTHON_SKIP_CHECK"))) {
 		return { ok: true };
 	}
 	const resolvedCwd = path.resolve(cwd);
 	const key = `${resolvedCwd}\0${interpreter ?? ""}`;
-	const cached = availabilityCache.get(key);
+	// A caller-scoped signal/deadline must never poison a shared cached probe.
+	// Only signal-independent checks are reusable by later callers.
+	const cacheable = !options?.forceProbe && options?.signal === undefined && options?.deadlineMs === undefined;
+	const cached = cacheable ? getCachedKernelAvailability(availabilityCache, key) : undefined;
 	if (cached) return await cached;
-	const probe = probePythonKernelAvailability(resolvedCwd, interpreter);
-	availabilityCache.set(key, probe);
-	const result = await probe;
-	if (!result.ok && availabilityCache.get(key) === probe) {
-		availabilityCache.delete(key);
-	}
-	return result;
+	const probe = probePythonKernelAvailability(resolvedCwd, interpreter, options);
+	if (cacheable) cacheKernelAvailabilityProbe(availabilityCache, key, probe);
+	return await probe;
 }
 
-async function probePythonKernelAvailability(cwd: string, interpreter?: string): Promise<PythonKernelAvailability> {
+async function probePythonKernelAvailability(
+	cwd: string,
+	interpreter?: string,
+	options?: { signal?: AbortSignal; deadlineMs?: number },
+): Promise<PythonKernelAvailability> {
 	try {
 		const settings = await Settings.init();
 		const { env } = settings.getShellConfig();
@@ -100,18 +116,32 @@ async function probePythonKernelAvailability(cwd: string, interpreter?: string):
 		const failures: string[] = [];
 		for (const runtime of runtimes) {
 			try {
-				const probe = await $`${runtime.pythonPath} -c "import sys;sys.exit(0)"`
-					.quiet()
-					.nothrow()
-					.cwd(cwd)
-					.env(runtime.env);
-				if (probe.exitCode === 0) {
+				// Availability must not hang on a PATH shim. Caller deadlines remain
+				// authoritative; the five-second guard is an internal candidate failure.
+				const probeDeadline = Math.min(options?.deadlineMs ?? Number.POSITIVE_INFINITY, Date.now() + 5_000);
+				const exitCode = await runKernelProbe([runtime.pythonPath, "-c", "import sys;sys.exit(0)"], {
+					cwd,
+					env: runtime.env,
+					signal: options?.signal,
+					deadlineMs: probeDeadline,
+					label: "Python",
+				});
+				if (exitCode === 0) {
 					return { ok: true, pythonPath: runtime.pythonPath, runtime };
 				}
-				failures.push(`${runtime.pythonPath} (exit code ${probe.exitCode})`);
+				failures.push(`${runtime.pythonPath} (exit code ${exitCode})`);
 			} catch (err) {
+				if (options?.signal?.aborted) throwIfAborted(options.signal, "Python kernel probe cancelled");
+				throwIfAborted(options?.signal, "Python kernel probe cancelled");
+				if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now()) {
+					throw createAbortError("TimeoutError", "Python kernel probe timed out");
+				}
 				failures.push(`${runtime.pythonPath} (${err instanceof Error ? err.message : String(err)})`);
 			}
+		}
+		throwIfAborted(options?.signal, "Python kernel probe cancelled");
+		if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now()) {
+			throw createAbortError("TimeoutError", "Python kernel probe timed out");
 		}
 		return {
 			ok: false,
@@ -119,6 +149,11 @@ async function probePythonKernelAvailability(cwd: string, interpreter?: string):
 			reason: `No working Python interpreter found. Tried: ${failures.join("; ")}`,
 		};
 	} catch (err) {
+		if (options?.signal?.aborted) throwIfAborted(options.signal, "Python kernel probe cancelled");
+		throwIfAborted(options?.signal, "Python kernel probe cancelled");
+		if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now()) {
+			throw createAbortError("TimeoutError", "Python kernel probe timed out");
+		}
 		return { ok: false, reason: err instanceof Error ? err.message : String(err) };
 	}
 }
@@ -149,10 +184,14 @@ export class PythonKernel extends BaseKernel {
 			checkPythonKernelAvailability,
 			options.cwd,
 			options.interpreter,
+			{ signal: options.signal, deadlineMs: options.deadlineMs },
 		);
 		if (!availability.ok) {
 			throw new Error(availability.reason ?? "Python kernel unavailable");
 		}
+		throwIfAborted(options.signal, "Python kernel startup cancelled");
+		if (options.deadlineMs !== undefined && options.deadlineMs <= Date.now())
+			throw createAbortError("TimeoutError", "Python kernel startup timed out");
 
 		let runtime = availability.runtime;
 		if (!runtime) {
@@ -168,9 +207,13 @@ export class PythonKernel extends BaseKernel {
 		for (const [key, value] of Object.entries(options.env ?? {})) {
 			if (typeof value === "string") spawnEnv[key] = value;
 		}
+		// Bridge credentials arrive on the request wire and are captured by the runner;
+		// never inherit them in the process environment.
+		for (const key of BRIDGE_ENV_KEYS) delete spawnEnv[key];
 		spawnEnv.PYTHONUNBUFFERED = "1";
 		spawnEnv.PYTHONIOENCODING = "utf-8";
 
+		throwIfAborted(options.signal, "Python kernel startup cancelled");
 		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
 		const kernel = new PythonKernel(Snowflake.next());
 
@@ -190,12 +233,13 @@ export class PythonKernel extends BaseKernel {
 		kernel.setProcess(proc);
 
 		const startup = { signal: options.signal, deadlineMs: options.deadlineMs };
-		const startupBudget = Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
 
 		try {
 			const initScript = buildInitScript(options.cwd, options.env);
-			await kernel.executeWithBudget(initScript, startup.signal, startupBudget, "Python kernel init");
-			await kernel.executeWithBudget(PYTHON_PRELUDE, startup.signal, startupBudget, "Python kernel prelude");
+			const phaseBudget = () =>
+				Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
+			await kernel.executeWithBudget(initScript, startup.signal, phaseBudget(), "Python kernel init");
+			await kernel.executeWithBudget(PYTHON_PRELUDE, startup.signal, phaseBudget(), "Python kernel prelude");
 			return kernel;
 		} catch (err) {
 			await kernel.shutdown({ timeoutMs: SHUTDOWN_GRACE_MS }).catch(() => {});
@@ -204,7 +248,9 @@ export class PythonKernel extends BaseKernel {
 	}
 }
 function buildInitScript(cwd: string, env?: Record<string, string | undefined>): string {
-	const envEntries = Object.entries(env ?? {}).filter(([, value]) => value !== undefined);
+	const envEntries = Object.entries(env ?? {}).filter(
+		([key, value]) => value !== undefined && !BRIDGE_ENV_KEYS.includes(key as (typeof BRIDGE_ENV_KEYS)[number]),
+	);
 	const envPayload = Object.fromEntries(envEntries);
 	return [
 		"import os, sys",

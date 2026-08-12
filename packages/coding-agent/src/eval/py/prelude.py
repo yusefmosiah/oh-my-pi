@@ -5,9 +5,21 @@ if "__omp_prelude_loaded__" not in globals():
     __omp_prelude_loaded__ = True
     from pathlib import Path
     import os, json, math, re
-    from urllib.parse import unquote
+    from urllib.parse import unquote, urlsplit, urlunsplit
 
     INTENT_FIELD = "i"
+
+    # runner.py exposes a value-only bridge hook. Bind it here so the bearer
+    # token never enters this namespace, os.environ, or a child process. Direct
+    # prelude embeddings retain a one-time legacy fallback for compatibility.
+    _omp_bridge_hook = globals().get("__omp_bridge_call__")
+    _omp_legacy_bridge_config = None
+    if not callable(_omp_bridge_hook):
+        _omp_legacy_bridge_config = tuple(os.environ.get(key) for key in (
+            "PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_TOKEN", "PI_TOOL_BRIDGE_SESSION"
+        ))
+        for _omp_bridge_key in ("PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_TOKEN", "PI_TOOL_BRIDGE_SESSION"):
+            os.environ.pop(_omp_bridge_key, None)
 
     # __omp_display is injected by runner.py before the prelude executes; it
     # mirrors IPython's display() semantics with the same MIME bundle output.
@@ -368,56 +380,80 @@ if "__omp_prelude_loaded__" not in globals():
 
         return current
 
-    def _tool_proxy_from_env() -> tuple[str, str, str]:
-        base = os.environ.get("PI_TOOL_BRIDGE_URL")
-        token = os.environ.get("PI_TOOL_BRIDGE_TOKEN")
-        session = os.environ.get("PI_TOOL_BRIDGE_SESSION")
-        if not base or not token or not session:
-            raise RuntimeError("tool bridge is unavailable in this kernel")
-        return (base.rstrip("/"), token, session)
 
+    import socket
     import urllib.error, urllib.request
 
     # urllib discovers environment and macOS SystemConfiguration proxies. This
-    # host-owned loopback endpoint must always connect directly.
+    # host-owned loopback endpoint must always connect directly. Keep transport
+    # waits bounded: host teardown can abort the request, but a blocking Python
+    # worker may not observe a closed loopback socket promptly.
     _BRIDGE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    _BRIDGE_TIMEOUT_SECONDS = 5 * 60
 
-    def _bridge_call(name: str, args: dict):
-        """POST one request to the host tool bridge and return its `value`."""
-        base, token, session = _tool_proxy_from_env()
-        _run_id_getter = globals().get("__omp_current_run_id__")
-        _run_id = (
-            _run_id_getter()
-            if callable(_run_id_getter)
-            else globals().get("__omp_run_id__")
-        )
-        payload = json.dumps(
-            {"session": session, "run": _run_id, "name": name, "args": args}
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            f"{base}/v1/tool",
-            data=payload,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
-        )
-        try:
-            with _BRIDGE_OPENER.open(req) as resp:
-                body = resp.read()
-        except urllib.error.HTTPError as exc:
-            body = exc.read()
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            raise RuntimeError(
-                f"bridge call {name!r}: non-JSON response: {body[:200]!r}"
-            ) from None
-        if not isinstance(data, dict) or not data.get("ok"):
-            msg = (data or {}).get("error") if isinstance(data, dict) else None
-            raise RuntimeError(msg or f"bridge call {name!r} failed")
-        return data.get("value")
+    def _make_bridge_call(_hook, _legacy_config):
+        if callable(_hook):
+            def bridge_call(name: str, args: dict):
+                return _hook(name, args)
+            return bridge_call
+
+        # Compatibility for callers embedding only PYTHON_PRELUDE. This path is
+        # never used by the persistent runner and may retain the one-time legacy
+        # config solely for those direct embeddings.
+        def bridge_call(name: str, args: dict):
+            values = _legacy_config
+            base, token, session = values
+            if not base or not session:
+                raise RuntimeError("tool bridge is unavailable in this kernel")
+            parsed = urlsplit(base)
+            endpoint = (
+                urlunsplit(parsed._replace(path="/v1/tool" if token else "/v1/eval-tool"))
+                if parsed.path in ("", "/")
+                else base
+            )
+            _run_id_getter = globals().get("__omp_current_run_id__")
+            _run_id = (
+                _run_id_getter()
+                if callable(_run_id_getter)
+                else globals().get("__omp_run_id__")
+            )
+            payload = json.dumps(
+                {"session": session, "run": _run_id, "name": name, "args": args}
+            ).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            req = urllib.request.Request(
+                endpoint,
+                data=payload,
+                method="POST",
+                headers=headers,
+            )
+            try:
+                with _BRIDGE_OPENER.open(req, timeout=_BRIDGE_TIMEOUT_SECONDS) as resp:
+                    body = resp.read()
+            except urllib.error.HTTPError as exc:
+                body = exc.read()
+            except (socket.timeout, TimeoutError) as exc:
+                raise RuntimeError(
+                    f"bridge call {name!r} timed out after {_BRIDGE_TIMEOUT_SECONDS:g}s"
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise RuntimeError(f"bridge call {name!r} transport failed: {exc.reason}") from exc
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                raise RuntimeError(
+                    f"bridge call {name!r}: non-JSON response: {body[:200]!r}"
+                ) from None
+            if not isinstance(data, dict) or not data.get("ok"):
+                msg = (data or {}).get("error") if isinstance(data, dict) else None
+                raise RuntimeError(msg or f"bridge call {name!r} failed")
+            return data.get("value")
+
+        return bridge_call
+
+    _bridge_call = _make_bridge_call(_omp_bridge_hook, _omp_legacy_bridge_config)
 
     class _ToolCallable:
         """Invokes one host-side tool via the loopback HTTP bridge."""
@@ -458,12 +494,9 @@ if "__omp_prelude_loaded__" not in globals():
             return _ToolCallable(name)
 
         def __repr__(self) -> str:
-            session = os.environ.get("PI_TOOL_BRIDGE_SESSION")
-            return (
-                f"<tool proxy session={session}>"
-                if session
-                else "<tool proxy unavailable>"
-            )
+            # Do not expose even the bridge session in a user-facing repr; the
+            # runner owns all bridge identity and credentials.
+            return "<tool proxy>"
 
     tool = _ToolProxy()
 
@@ -671,3 +704,14 @@ if "__omp_prelude_loaded__" not in globals():
                 return "<budget unavailable>"
 
     budget = _Budget()
+
+    # The bridge getter/config are implementation details. Remove their names
+    # from the persistent user namespace after binding them into _bridge_call.
+    for _omp_private_name in (
+        "_omp_bridge_hook",
+        "_omp_legacy_bridge_config",
+        "_make_bridge_call",
+        "__omp_get_bridge_credentials__",
+        "__omp_bridge_call__",
+    ):
+        globals().pop(_omp_private_name, None)

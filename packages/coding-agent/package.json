@@ -46,7 +46,9 @@
     "gen:native": "bun --cwd=../natives run gen:native",
     "gen:native:reset": "bun --cwd=../natives run gen:native:reset",
     "prepack": "bun run gen:tool-views && bun run gen:bundle",
-    "bench:guard": "bun scripts/bench-guard.ts"
+    "bench:guard": "bun scripts/bench-guard.ts",
+    "build:go-runner": "bun scripts/build-go-runner.ts",
+    "go-eval": "bun scripts/run-go-eval.ts"
   },
   "dependencies": {
     "@babel/parser": "catalog:",
@@ -349,6 +351,30 @@
       "types": "./src/eval/index.ts",
       "import": "./src/eval/index.ts"
     },
+    "./eval/js": {
+      "types": "./src/eval/js/index.ts",
+      "import": "./src/eval/js/index.ts"
+    },
+    "./eval/py": {
+      "types": "./src/eval/py/index.ts",
+      "import": "./src/eval/py/index.ts"
+    },
+    "./eval/rb": {
+      "types": "./src/eval/rb/index.ts",
+      "import": "./src/eval/rb/index.ts"
+    },
+    "./eval/jl": {
+      "types": "./src/eval/jl/index.ts",
+      "import": "./src/eval/jl/index.ts"
+    },
+    "./eval/go": {
+      "types": "./src/eval/go/index.ts",
+      "import": "./src/eval/go/index.ts"
+    },
+    "./eval/tool-bridge": {
+      "types": "./src/eval/tool-bridge.ts",
+      "import": "./src/eval/tool-bridge.ts"
+    },
     "./eval/js/*": {
       "types": "./src/eval/js/*.ts",
       "import": "./src/eval/js/*.ts"
@@ -356,6 +382,18 @@
     "./eval/py/*": {
       "types": "./src/eval/py/*.ts",
       "import": "./src/eval/py/*.ts"
+    },
+    "./eval/rb/*": {
+      "types": "./src/eval/rb/*.ts",
+      "import": "./src/eval/rb/*.ts"
+    },
+    "./eval/jl/*": {
+      "types": "./src/eval/jl/*.ts",
+      "import": "./src/eval/jl/*.ts"
+    },
+    "./eval/go/*": {
+      "types": "./src/eval/go/*.ts",
+      "import": "./src/eval/go/*.ts"
     },
     "./lsp": {
       "types": "./src/lsp/index.ts",

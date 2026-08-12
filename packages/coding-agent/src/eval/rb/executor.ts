@@ -181,7 +181,10 @@ async function executeWithKernel(
 
 async function ensureKernelAvailable(cwd: string, options: RubyExecutorOptions): Promise<void> {
 	const availability = await waitForPromiseWithCancellation(
-		checkRubyKernelAvailability(cwd, options.interpreter),
+		checkRubyKernelAvailability(cwd, options.interpreter, {
+			signal: options.signal,
+			deadlineMs: options.deadlineMs,
+		}),
 		options,
 		RubyExecutionCancelledError,
 	);
@@ -198,6 +201,11 @@ async function ensureToolBridge(options: RubyExecutorOptions): Promise<void> {
 		logger.warn("Failed to start Ruby tool bridge", {
 			error: err instanceof Error ? err.message : String(err),
 		});
+		// A ToolSession means the runtime is expected to have authenticated host
+		// capabilities. Do not silently continue without them: a later `omp.Tool`
+		// call would fail after user code has already started, obscuring the bridge
+		// lifecycle error and potentially leaving a partially initialized session.
+		throw err;
 	}
 }
 
@@ -216,6 +224,7 @@ const sessionRegistry = createKernelSessionRegistry<
 	createSession: session => session,
 	startKernel,
 	executeWithKernel,
+	validateKernel: (session, kernel) => session.kernel === kernel,
 });
 
 export async function disposeAllRubyKernelSessions(): Promise<void> {

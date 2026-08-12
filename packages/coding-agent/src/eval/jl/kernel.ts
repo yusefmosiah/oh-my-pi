@@ -6,10 +6,19 @@
  * script, and the runner's TSV/Base64 wire protocol.
  */
 import * as path from "node:path";
-import { $flag, Snowflake } from "@oh-my-pi/pi-utils";
-import { $ } from "bun";
+import { $flag, isBunTestRuntime, Snowflake } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../config/settings";
-import { BaseKernel, getRemainingTimeMs, type KernelStartOptions } from "../kernel-base";
+import {
+	BaseKernel,
+	cacheKernelAvailabilityProbe,
+	createAbortError,
+	getCachedKernelAvailability,
+	getRemainingTimeMs,
+	type KernelAvailabilityCacheEntry,
+	type KernelStartOptions,
+	runKernelProbe,
+	throwIfAborted,
+} from "../kernel-base";
 import type { KernelDisplayOutput } from "../py/display";
 import { hostHasInheritableConsole, shouldDetachKernel, shouldHideKernelWindow } from "../py/spawn-options";
 import { stageRunnerScript } from "../runner-cache";
@@ -32,6 +41,7 @@ const TRACE_IPC = $flag("PI_JULIA_IPC_TRACE");
 const SHUTDOWN_GRACE_MS = 1_000;
 const STARTUP_TIMEOUT_MS = 15_000; // Julia compile/warmup can be slightly slower
 const INTERRUPT_ESCALATION_MS = 5_000;
+const BRIDGE_ENV_KEYS = ["PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_TOKEN", "PI_TOOL_BRIDGE_SESSION"] as const;
 
 export interface KernelExecuteOptions {
 	id?: string;
@@ -54,26 +64,33 @@ export interface JuliaKernelAvailability {
 
 // Cache successful probes per resolved cwd + explicit interpreter. Failures are
 // not cached so installing Julia mid-session is picked up on the next attempt.
-const availabilityCache = new Map<string, Promise<JuliaKernelAvailability>>();
+const availabilityCache = new Map<string, KernelAvailabilityCacheEntry<JuliaKernelAvailability>>();
 
 export async function checkJuliaKernelAvailability(
 	cwd: string,
 	interpreter?: string,
+	options?: { forceProbe?: boolean; signal?: AbortSignal; deadlineMs?: number },
 ): Promise<JuliaKernelAvailability> {
+	throwIfAborted(options?.signal, "Julia kernel availability probe cancelled");
+	if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now())
+		throw createAbortError("TimeoutError", "Julia kernel availability probe timed out");
+	if (!options?.forceProbe && isBunTestRuntime()) {
+		return { ok: true };
+	}
 	const cacheKey = `${path.resolve(cwd)}::${interpreter ?? ""}`;
-	let cached = availabilityCache.get(cacheKey);
-	if (!cached) {
-		cached = probeJuliaKernelAvailability(cwd, interpreter);
-		availabilityCache.set(cacheKey, cached);
-	}
-	const result = await cached;
-	if (!result.ok) {
-		availabilityCache.delete(cacheKey);
-	}
-	return result;
+	const cacheable = !options?.forceProbe && options?.signal === undefined && options?.deadlineMs === undefined;
+	const cached = cacheable ? getCachedKernelAvailability(availabilityCache, cacheKey) : undefined;
+	if (cached) return await cached;
+	const probe = probeJuliaKernelAvailability(cwd, interpreter, options);
+	if (cacheable) cacheKernelAvailabilityProbe(availabilityCache, cacheKey, probe);
+	return await probe;
 }
 
-async function probeJuliaKernelAvailability(cwd: string, interpreter?: string): Promise<JuliaKernelAvailability> {
+async function probeJuliaKernelAvailability(
+	cwd: string,
+	interpreter?: string,
+	options?: { signal?: AbortSignal; deadlineMs?: number },
+): Promise<JuliaKernelAvailability> {
 	const { env: shellEnv } = (await Settings.init()).getShellConfig();
 	const baseEnv = filterEnv(shellEnv);
 	const runtimes = enumerateJuliaRuntimes(cwd, baseEnv, interpreter);
@@ -88,16 +105,34 @@ async function probeJuliaKernelAvailability(cwd: string, interpreter?: string): 
 	const failures: string[] = [];
 	for (const runtime of runtimes) {
 		try {
-			const probe = await $`${runtime.juliaPath} -e "exit(0)"`.quiet().nothrow().cwd(cwd).env(runtime.env);
-			if (probe.exitCode === 0) {
+			// Availability must not hang on a PATH shim. Caller deadlines remain
+			// authoritative; the five-second guard is an internal candidate failure.
+			const probeDeadline = Math.min(options?.deadlineMs ?? Number.POSITIVE_INFINITY, Date.now() + 5_000);
+			const exitCode = await runKernelProbe([runtime.juliaPath, "-e", "exit(0)"], {
+				cwd,
+				env: runtime.env,
+				signal: options?.signal,
+				deadlineMs: probeDeadline,
+				label: "Julia",
+			});
+			if (exitCode === 0) {
 				return { ok: true, juliaPath: runtime.juliaPath, runtime };
 			}
-			failures.push(`${runtime.juliaPath} (exit code ${probe.exitCode})`);
+			failures.push(`${runtime.juliaPath} (exit code ${exitCode})`);
 		} catch (err) {
+			if (options?.signal?.aborted) throwIfAborted(options.signal, "Julia kernel probe cancelled");
+			throwIfAborted(options?.signal, "Julia kernel probe cancelled");
+			if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now()) {
+				throw createAbortError("TimeoutError", "Julia kernel probe timed out");
+			}
 			failures.push(`${runtime.juliaPath} (${err instanceof Error ? err.message : String(err)})`);
 		}
 	}
 
+	throwIfAborted(options?.signal, "Julia kernel probe cancelled");
+	if (options?.deadlineMs !== undefined && options.deadlineMs <= Date.now()) {
+		throw createAbortError("TimeoutError", "Julia kernel probe timed out");
+	}
 	return {
 		ok: false,
 		juliaPath: runtimes[0].juliaPath,
@@ -140,10 +175,16 @@ export class JuliaKernel extends BaseKernel<KernelExecuteOptions> {
 	}
 
 	static async start(options: KernelStartOptions): Promise<JuliaKernel> {
-		const availability = await checkJuliaKernelAvailability(options.cwd, options.interpreter);
+		const availability = await checkJuliaKernelAvailability(options.cwd, options.interpreter, {
+			signal: options.signal,
+			deadlineMs: options.deadlineMs,
+		});
 		if (!availability.ok) {
 			throw new Error(availability.reason ?? "Julia kernel unavailable");
 		}
+		throwIfAborted(options.signal, "Julia kernel startup cancelled");
+		if (options.deadlineMs !== undefined && options.deadlineMs <= Date.now())
+			throw createAbortError("TimeoutError", "Julia kernel startup timed out");
 
 		let runtime = availability.runtime;
 		if (!runtime) {
@@ -161,7 +202,11 @@ export class JuliaKernel extends BaseKernel<KernelExecuteOptions> {
 			const value = options.env[key];
 			if (typeof value === "string") spawnEnv[key] = value;
 		}
+		// Bridge credentials arrive on the request wire and are captured by the runner;
+		// never inherit them in the process environment.
+		for (const key of BRIDGE_ENV_KEYS) delete spawnEnv[key];
 
+		throwIfAborted(options.signal, "Julia kernel startup cancelled");
 		const scriptPath = await stageRunnerScript("omp-julia-runner", "jl", RUNNER_SCRIPT);
 		const kernel = new JuliaKernel(Snowflake.next());
 
@@ -183,12 +228,13 @@ export class JuliaKernel extends BaseKernel<KernelExecuteOptions> {
 		kernel.setProcess(proc);
 
 		const startup = { signal: options.signal, deadlineMs: options.deadlineMs };
-		const startupBudget = Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
 
 		try {
 			const initScript = buildInitScript(options.cwd, options.env);
-			await kernel.executeWithBudget(initScript, startup.signal, startupBudget, "Julia kernel init");
-			await kernel.executeWithBudget(JULIA_PRELUDE, startup.signal, startupBudget, "Julia kernel prelude");
+			const phaseBudget = () =>
+				Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
+			await kernel.executeWithBudget(initScript, startup.signal, phaseBudget(), "Julia kernel init");
+			await kernel.executeWithBudget(JULIA_PRELUDE, startup.signal, phaseBudget(), "Julia kernel prelude");
 			return kernel;
 		} catch (err) {
 			await kernel.shutdown({ timeoutMs: SHUTDOWN_GRACE_MS }).catch(() => {});
@@ -201,7 +247,8 @@ function buildInitScript(cwd: string, env?: Record<string, string | undefined>):
 	const envPayload: Record<string, string> = {};
 	for (const key in env) {
 		const value = env[key];
-		if (value !== undefined) envPayload[key] = value;
+		if (value !== undefined && !BRIDGE_ENV_KEYS.includes(key as (typeof BRIDGE_ENV_KEYS)[number]))
+			envPayload[key] = value;
 	}
 	const lines = [
 		`__omp_init_cwd = String(Base64.base64decode("${Buffer.from(cwd).toString("base64")}"))`,

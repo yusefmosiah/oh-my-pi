@@ -53,7 +53,8 @@ function getExecutionTimeoutMs(options: Pick<JsExecutorOptions, "deadlineMs" | "
 function isAbortError(error: unknown): boolean {
 	return (
 		(error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) ||
-		(error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"))
+		(error instanceof Error &&
+			(error.name === "AbortError" || error.name === "TimeoutError" || error.name === "ToolAbortError"))
 	);
 }
 
@@ -85,10 +86,27 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 		onChunk: chunk => options.onChunk?.(chunk),
 	});
 	const legacyTimeoutMs = getExecutionTimeoutMs(options);
-	const timeoutSignal =
-		typeof legacyTimeoutMs === "number" && Number.isFinite(legacyTimeoutMs) && legacyTimeoutMs > 0
-			? AbortSignal.timeout(legacyTimeoutMs)
+	// Keep the timeout source alive for the entire cell. Bun cancels an
+	// AbortSignal.timeout timer when its last abort listener is removed; startup
+	// waits briefly attach/remove their listener before user code begins, which
+	// would otherwise silently disable a short cell timeout. An owned controller
+	// and timer have explicit lifetime independent of listener registration.
+	const hasFiniteTimeout = typeof legacyTimeoutMs === "number" && Number.isFinite(legacyTimeoutMs);
+	const timeoutController = hasFiniteTimeout ? new AbortController() : undefined;
+	const timeoutTimer =
+		timeoutController && legacyTimeoutMs! > 0
+			? setTimeout(
+					() => timeoutController.abort(new DOMException("The operation timed out.", "TimeoutError")),
+					legacyTimeoutMs!,
+				)
 			: undefined;
+	// A non-positive timeout is an already-expired budget, not an unlimited one.
+	// Abort synchronously so no worker/bridge startup begins for this call.
+	if (timeoutController && legacyTimeoutMs! <= 0) {
+		timeoutController.abort(new DOMException("The operation timed out.", "TimeoutError"));
+	}
+	timeoutTimer?.unref?.();
+	const timeoutSignal = timeoutController?.signal;
 	const signal =
 		options.signal && timeoutSignal
 			? AbortSignal.any([options.signal, timeoutSignal])
@@ -173,6 +191,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			displayOutputs,
 		};
 	} finally {
+		if (timeoutTimer) clearTimeout(timeoutTimer);
 		await outputSink.dispose();
 	}
 }

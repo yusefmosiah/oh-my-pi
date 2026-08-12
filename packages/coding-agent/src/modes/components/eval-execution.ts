@@ -19,7 +19,7 @@ import {
 const PREVIEW_LINES = 20;
 const MAX_DISPLAY_LINE_CHARS = 4000;
 
-export type EvalExecutionLanguage = "python" | "js";
+export type EvalExecutionLanguage = "python" | "js" | "go";
 
 export class EvalExecutionComponent extends Container {
 	#outputLines: string[] = [];
@@ -30,8 +30,10 @@ export class EvalExecutionComponent extends Container {
 	#expanded = false;
 	#contentContainer: Container;
 
-	#highlightLang(): "python" | "javascript" {
-		return this.language === "js" ? "javascript" : "python";
+	#highlightLang(): "python" | "javascript" | "go" {
+		if (this.language === "js") return "javascript";
+		if (this.language === "go") return "go";
+		return "python";
 	}
 
 	#formatHeader(colorKey: ExecutionColorKey): Text {

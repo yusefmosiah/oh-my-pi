@@ -28,8 +28,10 @@ export default {
 	label: "Python",
 	highlightLang: "python",
 
-	async isAvailable(session: ToolSession): Promise<boolean> {
-		const availability = await checkPythonKernelAvailability(session.cwd, readInterpreterSetting(session));
+	async isAvailable(session: ToolSession, signal?: AbortSignal): Promise<boolean> {
+		const availability = await checkPythonKernelAvailability(session.cwd, readInterpreterSetting(session), {
+			signal,
+		});
 		return availability.ok;
 	},
 

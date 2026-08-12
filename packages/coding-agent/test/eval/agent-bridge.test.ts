@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runEvalAgent } from "@oh-my-pi/pi-coding-agent/eval/agent-bridge";
 import type { LocalProtocolOptions } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp";
+import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as taskDiscovery from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as taskExecutor from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-coding-agent/task/types";
@@ -92,5 +94,57 @@ describe("runEvalAgent", () => {
 
 		expect(result.data).toEqual({ status: "ok" });
 		expect(result.details).toMatchObject({ structured: true, schemaSource: "agent", schemaMode: "strict" });
+	});
+	it("returns a live job when asynchronous execution is requested", async () => {
+		const agent: AgentDefinition = {
+			name: "task",
+			description: "Task agent",
+			systemPrompt: "Handle the task.",
+			source: "bundled",
+		};
+		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
+		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options =>
+			createResult({
+				id: options.id ?? "worker",
+				agent: options.agent.name,
+				task: options.task,
+			}),
+		);
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		try {
+			const sessionBase = {
+				cwd: "/tmp",
+				hasUI: false,
+				settings: Settings.isolated({
+					"async.enabled": true,
+					"task.isolation.mode": "none",
+				}),
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				getAgentId: () => "BridgeParent",
+				asyncJobManager: manager,
+			} as unknown as ToolSession;
+			const taskTool = await TaskTool.create(sessionBase);
+			const session = {
+				...sessionBase,
+				getToolByName: (name: string) => (name === "task" ? taskTool : undefined),
+			} as unknown as ToolSession;
+
+			const result = await runEvalAgent({ prompt: "do work", async: true }, { session });
+
+			expect(result.text).toContain("Spawned agent");
+			expect(result.details).toMatchObject({
+				agent: "task",
+				async: { state: "running", type: "task" },
+			});
+			const jobId = result.details.async?.jobId;
+			expect(jobId).toBeString();
+			const job = manager.getJob(jobId!);
+			expect(job?.agentId).toBe(result.details.id);
+			await job?.promise;
+			expect(job?.status).toBe("completed");
+		} finally {
+			await manager.dispose({ timeoutMs: 1_000 });
+		}
 	});
 });
