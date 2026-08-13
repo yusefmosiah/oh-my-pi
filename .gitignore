@@ -51,6 +51,7 @@ packages/ai/test/.temp-images/
 compaction-results/
 changes/
 __pycache__/
+.agentic-consensus/
 
 # Scratch files
 syntax.jsonl
